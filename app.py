@@ -354,7 +354,12 @@ def _configured_resolution(cam_id: str) -> tuple[Optional[int], Optional[int]]:
 def default_config() -> Dict[str, Any]:
     return {
         "host": DEFAULT_CAMERA_HOST,
-        "auth": {"enabled": False, "username": "", "password": ""},
+        "auth": {
+            "enabled": False,
+            "protect_streams": False,
+            "username": "",
+            "password": "",
+        },
         "cameras": [],
     }
 
@@ -453,6 +458,8 @@ def load_config() -> Dict[str, Any]:
 
     if "auth" not in config:
         config["auth"] = default_config()["auth"].copy()
+    else:
+        config["auth"].setdefault("protect_streams", False)
 
     assigned_cameras = assign_ports(config.get("cameras", []))
     try:
@@ -460,8 +467,6 @@ def load_config() -> Dict[str, Any]:
         config.pop("auth_error", None)
     except ValueError as exc:  # noqa: BLE001
         config["auth_error"] = str(exc)
-        if config.get("auth"):
-            config["auth"]["enabled"] = False
         logger.error("Invalid auth configuration: %s", exc)
     try:
         validate_camera_entries(assigned_cameras)
@@ -645,6 +650,9 @@ class CameraConfig(BaseModel):
 
 class AuthConfig(BaseModel):
     enabled: bool = Field(default=False, description="Enable HTTP basic auth")
+    protect_streams: bool = Field(
+        default=False, description="Apply auth to /cam/* streams as well"
+    )
     username: str = Field(default="", description="Basic auth username")
     password: str = Field(default="", description="Basic auth password")
 
@@ -675,11 +683,14 @@ def _auth_enabled() -> bool:
 
 
 def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)) -> None:
+    if CAMERA_CONFIG.get("auth_error"):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Auth configuration error: {CAMERA_CONFIG['auth_error']}",
+        )
+
     if not _auth_enabled():
         return
-
-    expected_user = CAMERA_CONFIG.get("auth", {}).get("username", "")
-    expected_pass = CAMERA_CONFIG.get("auth", {}).get("password", "")
 
     if not credentials or not credentials.username:
         raise HTTPException(
@@ -687,6 +698,9 @@ def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)
             detail="Authentication required",
             headers={"WWW-Authenticate": "Basic"},
         )
+
+    expected_user = CAMERA_CONFIG.get("auth", {}).get("username", "")
+    expected_pass = CAMERA_CONFIG.get("auth", {}).get("password", "")
 
     if not (
         secrets.compare_digest(credentials.username, expected_user)
@@ -697,6 +711,15 @@ def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)
             detail="Invalid credentials",
             headers={"WWW-Authenticate": "Basic"},
         )
+
+
+def require_stream_auth(
+    credentials: Optional[HTTPBasicCredentials] = Depends(security),
+) -> None:
+    auth_cfg = CAMERA_CONFIG.get("auth", {})
+    if not auth_cfg.get("protect_streams"):
+        return
+    require_auth(credentials)
 
 
 def stop_cameras() -> None:
@@ -1164,12 +1187,13 @@ def settings_page():
                 <div style='display:flex; gap:12px; flex-wrap:wrap; align-items:center;'>
                     <label class='muted'>Authentication (optional)</label>
                     <label style='display:flex; gap:6px; align-items:center;'><input type='checkbox' id='auth-enabled'> Require basic auth for settings/API</label>
+                    <label style='display:flex; gap:6px; align-items:center;'><input type='checkbox' id='auth-streams'> Protect streams too</label>
                 </div>
                 <div style='display:flex; gap:10px; flex-wrap:wrap;'>
                     <input class='input' id='auth-username' placeholder='admin' style='max-width:160px;'>
                     <input class='input' id='auth-password' type='password' placeholder='password' style='max-width:180px;'>
                 </div>
-                <p class='muted' style='margin:0;'>If enabled, browsers will prompt for these credentials on configuration endpoints.</p>
+                <p class='muted' style='margin:0;'>If enabled, browsers will prompt for these credentials on configuration endpoints (and streams if selected).</p>
             </div>
             <div style='margin-top:16px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;'>
                 <div>
@@ -1202,6 +1226,7 @@ def settings_page():
             const tbody = document.querySelector('#cam-table tbody');
             const status = document.getElementById('status');
             const authEnabled = document.getElementById('auth-enabled');
+            const authStreams = document.getElementById('auth-streams');
             const authUser = document.getElementById('auth-username');
             const authPass = document.getElementById('auth-password');
             const probeMissingEl = document.getElementById('probe-missing');
@@ -1274,9 +1299,9 @@ def settings_page():
                     <td><input class='input' value='${cam.width ?? ''}' type='number' min='0' style='width:100px' placeholder='auto'></td>
                     <td><input class='input' value='${cam.height ?? ''}' type='number' min='0' style='width:100px' placeholder='auto'></td>
                     <td><input class='input' value='${cam.fps ?? ''}' type='number' min='0' step='0.1' style='width:100px' placeholder='auto'></td>
-                    <td><input class='input' value='${cam.brightness ?? ''}' type='number' step='0.1' style='width:120px' placeholder='auto'></td>
-                    <td><input class='input' value='${cam.exposure ?? ''}' type='number' step='0.1' style='width:120px' placeholder='auto'></td>
-                    <td><input class='input' value='${cam.white_balance ?? ''}' type='number' step='1' style='width:120px' placeholder='auto'></td>
+                    <td><input class='input' value='${cam.brightness ?? ''}' type='number' step='0.1' min='0' max='1' style='width:120px' placeholder='0.0–1.0'></td>
+                    <td><input class='input' value='${cam.exposure ?? ''}' type='number' step='0.1' min='0' max='10000' style='width:120px' placeholder='0–10000'></td>
+                    <td><input class='input' value='${cam.white_balance ?? ''}' type='number' step='1' min='0' max='12000' style='width:120px' placeholder='0–12000'></td>
                     <td style='width:60px; text-align:right;'><button class='btn-secondary btn' onclick='this.closest("tr").remove(); updateDeviceSelects();'>✖</button></td>
                 `;
                 tbody.appendChild(tr);
@@ -1290,11 +1315,12 @@ def settings_page():
                     document.querySelector('#host').value = data.host || '';
                     const authCfg = data.auth || {};
                     authEnabled.checked = !!authCfg.enabled;
+                    authStreams.checked = !!authCfg.protect_streams;
                     authUser.value = authCfg.username || '';
                     authPass.value = authCfg.password || '';
                     tbody.innerHTML = '';
                     (data.cameras || []).forEach(addRow);
-                    await refreshDevices(false, true);
+                    await refreshDevices(defaultProbeMissing, true);
                     setStatus('Loaded configuration.');
                 } catch (err) {
                     setStatus('Failed to load configuration: ' + err, 'error');
@@ -1302,7 +1328,7 @@ def settings_page():
             }
 
             async function refreshDevices(showStatus=true, allowSkip=false) {
-                if (!allowSkip && !probeMissingEl.checked && !defaultProbeMissing && !devices.length) {
+                if (allowSkip && !probeMissingEl.checked && !defaultProbeMissing && !devices.length) {
                     renderDeviceList();
                     updateDeviceSelects();
                     if (showStatus) setStatus('Discovery skipped. Enable probing to scan indices.', 'muted');
@@ -1367,6 +1393,7 @@ def settings_page():
                 const seenPorts = new Set();
                 const authCfg = {
                     enabled: authEnabled.checked,
+                    protect_streams: authStreams.checked && authEnabled.checked,
                     username: authUser.value.trim(),
                     password: authPass.value,
                 };
@@ -1460,11 +1487,13 @@ def api_docs_page():
             <ul>
                 <li><code>GET /api/cameras</code> — returns the current host and camera list.</li>
                 <li><code>POST /api/cameras</code> — update host and cameras; regenerates nginx.cameras.conf and restarts capture.</li>
+                <li><code>DELETE /api/cameras/{{cam_id}}</code> — remove a camera and restart capture.</li>
+                <li><code>POST /api/cameras/{{cam_id}}/restart</code> — manually restart one camera without editing config.</li>
                 <li><code>GET /api/devices</code> — list detected video devices and whether they are already assigned.</li>
                 <li><code>GET /health</code> — summary of camera states (online, stale, offline) and last frame ages.</li>
                 <li><code>GET /metrics</code> — Prometheus-style gauges for availability, subscribers, and frame ages.</li>
             </ul>
-            <p class='muted'>Optional basic auth (configured in Settings) secures these endpoints and the Settings/API Docs pages; streams remain open by default.</p>
+            <p class='muted'>Optional basic auth (configured in Settings) secures these endpoints and the Settings/API Docs pages; you can also opt-in to protecting streams.</p>
             <p class='muted'>Camera fields: <code>id</code>, <code>name</code>, <code>device</code>, optional <code>port</code>, <code>width</code>, <code>height</code>, <code>fps</code>, and optional controls <code>brightness</code>, <code>exposure</code>, <code>white_balance</code>.</p>
             <h3>Streaming</h3>
             <p class='muted'>Replace <code>{{cam_id}}</code> with a configured camera ID.</p>
@@ -1519,9 +1548,23 @@ def set_cameras(data: CamerasUpdate):
     return {"status": "ok", "cameras": CAMERA_CONFIG}
 
 
-@app.post("/api/cameras/{cam_id}/restart")
+@app.post("/api/cameras/{cam_id}/restart", dependencies=[Depends(require_auth)])
 def restart_camera_endpoint(cam_id: str):
     return restart_camera(cam_id)
+
+
+@app.delete("/api/cameras/{cam_id}", dependencies=[Depends(require_auth)])
+def delete_camera(cam_id: str):
+    global CAMERA_CONFIG
+    cameras = [c for c in CAMERA_CONFIG.get("cameras", []) if c.get("id") != cam_id]
+    if len(cameras) == len(CAMERA_CONFIG.get("cameras", [])):
+        raise HTTPException(status_code=404, detail="Camera not configured")
+
+    CAMERA_CONFIG["cameras"] = assign_ports(cameras)
+    save_config(CAMERA_CONFIG)
+    init_cameras()
+    generate_nginx_config(CAMERA_CONFIG)
+    return {"status": "deleted", "cameras": CAMERA_CONFIG["cameras"]}
 
 
 @app.get("/health")
@@ -1572,7 +1615,7 @@ def metrics():
     return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
 
-@app.get("/cam/{cam_id}/video")
+@app.get("/cam/{cam_id}/video", dependencies=[Depends(require_stream_auth)])
 async def video_stream(cam_id: str):
     return StreamingResponse(
         mjpeg_generator(cam_id),
@@ -1580,7 +1623,7 @@ async def video_stream(cam_id: str):
     )
 
 
-@app.get("/cam/{cam_id}/snapshot")
+@app.get("/cam/{cam_id}/snapshot", dependencies=[Depends(require_stream_auth)])
 async def snapshot(cam_id: str):
     img_bytes = await asyncio.to_thread(get_snapshot_bytes, cam_id)
     return Response(content=img_bytes, media_type="image/jpeg")

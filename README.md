@@ -52,9 +52,10 @@ omitted. You can also set `width`, `height`, and `fps` to request a specific
 capture resolution and frame rate for each camera, plus optional `brightness`,
 `exposure`, and `white_balance` controls when supported by the device driver.
 If you want to guard the Settings/API endpoints, include an `auth` block with
-`enabled`, `username`, and `password`. When enabled, the browser will prompt for
-credentials on `/settings`, `/api/cameras`, and `/api/devices` while the streaming
-endpoints remain open by default.
+`enabled`, `username`, and `password`. Set `protect_streams` to `true` to require
+the same credentials on `/cam/{id}/video` and `/cam/{id}/snapshot`; otherwise
+streams stay open by default. Validation errors in the `auth` block are surfaced
+as `auth_error` instead of silently disabling auth.
 
 ### Run the server
 Start the main FastAPI control plane (defaults to port 8000; override with
@@ -78,6 +79,7 @@ Chromium policies), you can still manage the server headlessly:
 - Apply config: `curl -X POST http://<host>:8000/api/cameras -H 'Content-Type: application/json' -d @cameras.json`
 - Check status: `curl http://<host>:8000/health`
 - Scrape metrics: `curl http://<host>:8000/metrics`
+- Delete a camera: `curl -X DELETE http://<host>:8000/api/cameras/<id>`
 - Use the bundled helper: `python cli.py devices --no-probe-missing` or `python cli.py set cameras.json`
 
 ### Apply Nginx mapping

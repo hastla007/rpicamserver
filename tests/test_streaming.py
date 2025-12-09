@@ -147,6 +147,26 @@ def test_metrics_plain_text(monkeypatch):
     assert "rpicam_camera_online" in res.body.decode()
 
 
+def test_stream_auth_optional(client):
+    app.CAMERA_CONFIG = {
+        "host": "0.0.0.0",
+        "auth": {
+            "enabled": True,
+            "protect_streams": True,
+            "username": "u",
+            "password": "p",
+        },
+        "cameras": [{"id": "camM", "name": "One", "device": 0}],
+    }
+    app.CAMERAS = {}
+
+    res = client.get("/cam/camM/snapshot")
+    assert res.status_code == 401
+
+    res = client.get("/cam/camM/snapshot", auth=("u", "p"))
+    assert res.status_code == 200
+
+
 async def test_mjpeg_generator_tracks_subscribers(device_registry, sample_frame):
     device_registry[0] = {"frames": [sample_frame for _ in range(5)]}
     cam = app.Camera("cam0", 0)

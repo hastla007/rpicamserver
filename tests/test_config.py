@@ -133,7 +133,21 @@ def test_invalid_auth_is_reported(tmp_path, monkeypatch):
 
     cfg = app.load_config()
     assert cfg.get("auth_error")
-    assert cfg["auth"].get("enabled") is False
+    assert cfg["auth"].get("enabled") is True
+
+
+def test_require_auth_with_error(monkeypatch):
+    app.CAMERA_CONFIG = {
+        "host": "0.0.0.0",
+        "auth": {"enabled": True, "username": "user", "password": ""},
+        "cameras": [],
+        "auth_error": "Auth is enabled but username or password is missing.",
+    }
+
+    with pytest.raises(HTTPException) as exc:
+        app.require_auth(None)
+
+    assert exc.value.status_code == 500
 
 
 def test_require_auth_guard(monkeypatch):
