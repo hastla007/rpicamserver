@@ -112,6 +112,12 @@ def test_placeholder_returned_for_missing_camera(monkeypatch):
     assert isinstance(data, (bytes, bytearray))
     assert data
 
+    # placeholder should still be returned when a stub entry exists
+    app.CAMERAS = {"cam_missing": None}
+    data = app.get_snapshot_bytes("cam_missing")
+    assert isinstance(data, (bytes, bytearray))
+    assert data
+
 
 def test_health_summarises_status(monkeypatch):
     app.CAMERA_CONFIG = {
@@ -155,6 +161,20 @@ async def test_mjpeg_generator_tracks_subscribers(device_registry, sample_frame)
         await gen.aclose()
         cam.stop()
     assert cam._subscriber_count() == 0
+
+
+async def test_mjpeg_generator_uses_placeholder_when_offline(device_registry):
+    device_registry[0] = {"opened": False}
+    cam = app.Camera("camOffline", 0)
+    app.CAMERAS = {"camOffline": cam}
+
+    try:
+        gen = app.mjpeg_generator("camOffline")
+        frames = await _collect_frames(gen, 1)
+        assert frames and b"Content-Type: image/jpeg" in frames[0]
+    finally:
+        await gen.aclose()
+        cam.stop()
 
 
 def test_ui_routes_render(client):

@@ -77,6 +77,7 @@ Chromium policies), you can still manage the server headlessly:
 - Apply config: `curl -X POST http://<host>:8000/api/cameras -H 'Content-Type: application/json' -d @cameras.json`
 - Check status: `curl http://<host>:8000/health`
 - Scrape metrics: `curl http://<host>:8000/metrics`
+- Use the bundled helper: `python cli.py devices --no-probe-missing` or `python cli.py set cameras.json`
 
 ### Apply Nginx mapping
 
@@ -135,6 +136,10 @@ You can discover attached cameras (and which ones are already assigned) with
 - `GET /api/devices` – Enumerate detected video devices and flag ones already configured. Query params: `max` to cap the probe range (defaults to `MAX_DEVICE_PROBE`, 4), and `probe_missing=true` to force probing when no `/dev/video*` nodes are present (defaults to off).
 - `GET /cam/{id}/video` – MJPEG video stream for camera `{id}`
 - `GET /cam/{id}/snapshot` – Single JPEG frame for camera `{id}`
+- `GET /health` – JSON status of each configured camera (online/offline/stale with last-frame ages)
+- `GET /metrics` – Prometheus-style gauges for camera availability and subscriber counts
+
+Camera control ranges: brightness expects `0.0–1.0`, exposure `0–10000` (device-specific), and white balance `0–12000` Kelvin (0 usually means auto). Leave them blank for auto, and the server will reject values outside these bounds with a combined error message.
 
 ### Security
 
@@ -145,6 +150,7 @@ You can discover attached cameras (and which ones are already assigned) with
 
 - `LOG_DEST` (comma-separated) chooses logging sinks: `stdout`, `file`, `syslog`. Defaults to `stdout`. Provide `LOG_FILE` when including `file`.
 - `LOG_LEVEL` controls verbosity (defaults to `INFO`).
+- `CAMERA_RETRY_INTERVAL` controls how often a failed camera reopen is attempted (seconds, default `30`). Offline cameras stay routable and return placeholders until they recover.
 - `MAX_DEVICE_PROBE` caps how many numeric device indices are probed when no `/dev/video*` entries are present (default `4`).
 - `PROBE_WHEN_NO_DEVICES` (true/false) toggles probing numeric indices when globbing finds nothing (default `false` to avoid CPU churn in containerized environments).
 - The Settings UI surfaces the probe toggle and limit so you can avoid deep scans on systems without `/dev/video*` entries.

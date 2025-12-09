@@ -39,6 +39,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FILE = os.getenv("LOG_FILE")
 MAX_DEVICE_PROBE = int(os.getenv("MAX_DEVICE_PROBE", "4"))
 PROBE_WHEN_NO_DEVICES = os.getenv("PROBE_WHEN_NO_DEVICES", "false").lower() == "true"
+CAMERA_RETRY_INTERVAL = float(os.getenv("CAMERA_RETRY_INTERVAL", "30"))
 
 logger = logging.getLogger("rpicamserver")
 security = HTTPBasic(auto_error=False)
@@ -138,8 +139,24 @@ class Camera:
         self.idle_event = threading.Event()
         self.last_frame_ts = 0.0
         self.failure_count = 0
+        self.next_retry_ts = time.time()
 
-        self.cap = self._open_capture()
+        try:
+            self.cap = self._open_capture()
+            CAMERA_STATUS[self.cam_id] = {
+                "state": "online",
+                "message": "running",
+                "device": self.device_index,
+            }
+        except Exception as exc:  # noqa: BLE001
+            self.cap = None
+            self.next_retry_ts = time.time() + CAMERA_RETRY_INTERVAL
+            CAMERA_STATUS[self.cam_id] = {
+                "state": "offline",
+                "message": str(exc),
+                "device": self.device_index,
+            }
+            logger.error("Failed to start camera %s: %s", self.cam_id, exc)
 
         self.frame_lock = threading.Lock()
         self.latest_frame = None
@@ -185,17 +202,20 @@ class Camera:
             return self.active_subscribers
 
     def _restart_capture(self) -> None:
-        try:
-            self.cap.release()
-        except Exception:  # noqa: BLE001
-            pass
-
-        self.cap = None
+        if time.time() < self.next_retry_ts:
+            return
 
         try:
+            if self.cap:
+                try:
+                    self.cap.release()
+                except Exception:  # noqa: BLE001
+                    pass
+
             self.cap = self._open_capture()
             self.failure_count = 0
             self.idle_event.set()
+            self.next_retry_ts = time.time()
             CAMERA_STATUS[self.cam_id] = {
                 "state": "online",
                 "message": "running",
@@ -203,6 +223,8 @@ class Camera:
             }
             logger.info("Restarted camera device %s", self.device_index)
         except Exception as exc:  # noqa: BLE001
+            self.cap = None
+            self.next_retry_ts = time.time() + CAMERA_RETRY_INTERVAL
             CAMERA_STATUS[self.cam_id] = {
                 "state": "offline",
                 "message": str(exc),
@@ -213,7 +235,8 @@ class Camera:
     def _update_loop(self) -> None:
         while self.running:
             if not self.cap or not self.cap.isOpened():
-                self._restart_capture()
+                if time.time() >= self.next_retry_ts:
+                    self._restart_capture()
                 time.sleep(0.5)
                 continue
 
@@ -264,7 +287,8 @@ class Camera:
         self.running = False
         self.idle_event.set()
         self.thread.join(timeout=1)
-        self.cap.release()
+        if self.cap:
+            self.cap.release()
 
 
 def _encode_frame(frame, quality: int = 80) -> Optional[bytes]:
@@ -331,6 +355,13 @@ def default_config() -> Dict[str, Any]:
     }
 
 
+CONTROL_BOUNDS: Dict[str, tuple[float, float]] = {
+    "brightness": (0.0, 1.0),
+    "exposure": (0.0, 10000.0),
+    "white_balance": (0.0, 12000.0),
+}
+
+
 def validate_camera_entries(cameras: List[Dict[str, Any]]) -> None:
     """Validate required camera fields and uniqueness constraints."""
 
@@ -371,10 +402,17 @@ def validate_camera_entries(cameras: List[Dict[str, Any]]) -> None:
         }.items():
             if value is not None and value != "":
                 try:
-                    float(value)
+                    numeric = float(value)
                 except (TypeError, ValueError):
                     errors.append(
                         f"Camera '{cam_id or 'unknown'}' {field_name} must be numeric when provided."
+                    )
+                    continue
+
+                min_val, max_val = CONTROL_BOUNDS[field_name]
+                if numeric < min_val or numeric > max_val:
+                    errors.append(
+                        f"Camera '{cam_id or 'unknown'}' {field_name} should be between {min_val} and {max_val}."
                     )
         if port is not None:
             if port <= 0:
@@ -619,7 +657,7 @@ class CamerasUpdate(BaseModel):
 ###############################################################################
 
 
-CAMERAS: Dict[str, Camera] = {}
+CAMERAS: Dict[str, Optional[Camera]] = {}
 CAMERA_CONFIG: Dict[str, Any] = default_config()
 
 
@@ -660,7 +698,8 @@ def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)
 
 def stop_cameras() -> None:
     for camera in CAMERAS.values():
-        camera.stop()
+        if camera:
+            camera.stop()
     CAMERAS.clear()
     CAMERA_STATUS.clear()
 
@@ -690,21 +729,20 @@ def init_cameras() -> None:
                 white_balance=white_balance,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to start camera %s: %s", cam_id, exc)
+            logger.error("Failed to initialize camera %s: %s", cam_id, exc)
             CAMERA_STATUS[cam_id] = {
                 "state": "offline",
                 "message": str(exc),
                 "device": device_index,
             }
-            continue
+            # Create a stub entry so placeholders continue to work even when init fails
+            camera = None
 
-        CAMERAS[cam_id] = camera
-        CAMERA_STATUS[cam_id] = {
-            "state": "online",
-            "message": "running",
-            "device": device_index,
-        }
-        logger.info("Started camera %s on device %s", cam_id, device_index)
+        if camera:
+            CAMERAS[cam_id] = camera
+            logger.info("Started camera %s on device %s", cam_id, device_index)
+        else:
+            CAMERAS[cam_id] = None  # type: ignore[assignment]
 
 
 ###############################################################################
@@ -728,14 +766,15 @@ async def mjpeg_generator(cam_id: str):
             if camera:
                 frame = await asyncio.to_thread(camera.get_frame, True, 1.0)
                 if frame is None:
-                    await asyncio.sleep(0.1)
-                    continue
-
-                jpg_bytes = _encode_frame(frame, quality=80)
-                if jpg_bytes is None:
-                    await asyncio.sleep(camera.capture_interval)
-                    continue
-                sleep_interval = camera.capture_interval
+                    width, height = _configured_resolution(cam_id)
+                    jpg_bytes = _offline_placeholder(cam_id, width, height)
+                    sleep_interval = 1.0
+                else:
+                    jpg_bytes = _encode_frame(frame, quality=80)
+                    if jpg_bytes is None:
+                        await asyncio.sleep(camera.capture_interval)
+                        continue
+                    sleep_interval = camera.capture_interval
             else:
                 width, height = _configured_resolution(cam_id)
                 jpg_bytes = _offline_placeholder(cam_id, width, height)

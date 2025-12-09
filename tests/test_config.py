@@ -63,6 +63,20 @@ def test_validate_camera_entries_detects_conflicts():
             [{"id": "camC", "name": "Ctrl", "device": 0, "brightness": "abc"}]
         )
 
+    with pytest.raises(ValueError):
+        app.validate_camera_entries(
+            [
+                {
+                    "id": "camBad",
+                    "name": "Ctrl",
+                    "device": 0,
+                    "brightness": 5,
+                    "exposure": -1,
+                    "white_balance": 20000,
+                }
+            ]
+        )
+
 
 
 def test_camera_api_round_trip(isolate_app, tmp_path):
