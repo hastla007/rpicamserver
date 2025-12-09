@@ -1,0 +1,20 @@
+{
+  "host": "0.0.0.0",
+  "cameras": [
+    {
+      "id": "cam1",
+      "name": "USB Cam 1",
+      "device": 0,
+      "port": 8081,
+      "width": 1280,
+      "height": 720,
+      "fps": 30
+    },
+    {
+      "id": "cam2",
+      "name": "USB Cam 2",
+      "device": 1,
+      "port": 8082
+    }
+  ]
+}
