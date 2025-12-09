@@ -39,11 +39,24 @@ app = FastAPI(title="Raspberry Pi Camera Server")
 class Camera:
     """Background frame grabber for a single video device."""
 
-    def __init__(self, device_index: int):
+    def __init__(
+        self,
+        device_index: int,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        fps: Optional[float] = None,
+    ) -> None:
         self.device_index = device_index
         self.cap = cv2.VideoCapture(device_index)
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open camera device {device_index}")
+
+        if width:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+        if height:
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+        if fps:
+            self.cap.set(cv2.CAP_PROP_FPS, float(fps))
 
         self.frame_lock = threading.Lock()
         self.latest_frame = None
@@ -102,6 +115,9 @@ def validate_camera_entries(cameras: List[Dict[str, Any]]) -> None:
         name = str(cam.get("name", "")).strip()
         device = cam.get("device")
         port = cam.get("port")
+        width = cam.get("width")
+        height = cam.get("height")
+        fps = cam.get("fps")
 
         if not cam_id:
             raise ValueError("Camera id is required.")
@@ -111,6 +127,12 @@ def validate_camera_entries(cameras: List[Dict[str, Any]]) -> None:
             raise ValueError(f"Camera '{cam_id}' must have a name.")
         if device is None or device < 0:
             raise ValueError(f"Camera '{cam_id}' requires a non-negative device index.")
+        if width is not None and width <= 0:
+            raise ValueError(f"Camera '{cam_id}' width must be positive when provided.")
+        if height is not None and height <= 0:
+            raise ValueError(f"Camera '{cam_id}' height must be positive when provided.")
+        if fps is not None and fps <= 0:
+            raise ValueError(f"Camera '{cam_id}' fps must be positive when provided.")
         if port is not None:
             if port <= 0:
                 raise ValueError(f"Camera '{cam_id}' has an invalid port: {port}.")
@@ -180,6 +202,38 @@ def assign_ports(cameras: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return assigned
 
 
+def discover_cameras(max_devices: int = 10) -> List[Dict[str, Any]]:
+    """Probe video capture devices and return detected indices and metadata."""
+
+    discovered: List[Dict[str, Any]] = []
+    used_devices = {cam.get("device") for cam in CAMERA_CONFIG.get("cameras", [])}
+
+    for idx in range(max_devices):
+        cap = cv2.VideoCapture(idx)
+        if not cap.isOpened():
+            cap.release()
+            continue
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        cap.release()
+
+        discovered.append(
+            {
+                "index": idx,
+                "in_use": idx in used_devices,
+                "resolution": {
+                    "width": width or None,
+                    "height": height or None,
+                },
+                "fps": fps or None,
+            }
+        )
+
+    return discovered
+
+
 def generate_nginx_config(config: Dict[str, Any], output_path: Path = NGINX_CONFIG_PATH) -> None:
     """Write an nginx config mapping per-camera ports to the main API."""
 
@@ -224,6 +278,9 @@ class CameraConfig(BaseModel):
     port: Optional[int] = Field(
         default=None, description="Port for the per-camera proxy (via Nginx)"
     )
+    width: Optional[int] = Field(default=None, description="Capture width")
+    height: Optional[int] = Field(default=None, description="Capture height")
+    fps: Optional[float] = Field(default=None, description="Requested FPS")
 
 
 class CamerasUpdate(BaseModel):
@@ -252,9 +309,12 @@ def init_cameras() -> None:
     for cam_cfg in CAMERA_CONFIG.get("cameras", []):
         cam_id = cam_cfg["id"]
         device_index = cam_cfg["device"]
+        width = cam_cfg.get("width")
+        height = cam_cfg.get("height")
+        fps = cam_cfg.get("fps")
 
         try:
-            camera = Camera(device_index)
+            camera = Camera(device_index, width=width, height=height, fps=fps)
         except Exception as exc:  # noqa: BLE001
             print(f"Failed to start camera {cam_id}: {exc}")
             continue
@@ -329,7 +389,7 @@ def _base_page(title: str, active: str, body: str) -> str:
     }
 
     nav_html = "".join(
-        f"<a class='nav-link {'active' if key == active else ''}' href='{href}'>"
+        f"<a class='{'nav-link active' if key == active else 'nav-link'}' href='{href}'>"
         f"{label}</a>" for key, (href, label) in nav_items.items()
     )
 
@@ -453,6 +513,16 @@ def index_page():
         cam_id = cam["id"]
         port = cam.get("port")
         name = cam.get("name", cam_id)
+        width = cam.get("width")
+        height = cam.get("height")
+        fps = cam.get("fps")
+        res_text = (
+            f"{width}×{height}"
+            if width and height
+            else "Default resolution"
+        )
+        if fps:
+            res_text += f" @ {fps} fps"
         cards.append(
             f"""
             <div class='card'>
@@ -461,6 +531,7 @@ def index_page():
                         <div class='pill'>🎥 Camera · {cam_id}</div>
                         <h3 style='margin:8px 0 4px;'>{name}</h3>
                         <p class='muted'>Device index: {cam['device']}</p>
+                        <p class='muted'>Capture: {res_text}</p>
                     </div>
                     <div style='text-align:right;'>
                         <div class='muted'>Port</div>
@@ -520,14 +591,21 @@ def settings_page():
                 <label class='muted'>Binding host</label>
                 <input class='input' id='host' placeholder='0.0.0.0'>
             </div>
-            <div style='margin-top:16px; display:flex; justify-content:space-between; align-items:center;'>
-                <h3 style='margin:0;'>Cameras</h3>
-                <button class='btn-secondary btn' onclick='addRow()'>＋ Add camera</button>
+            <div style='margin-top:16px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;'>
+                <div>
+                    <h3 style='margin:0;'>Cameras</h3>
+                    <p class='muted' style='margin:4px 0 0;'>Pick from unused devices when adding a new entry.</p>
+                </div>
+                <div style='display:flex; gap:8px; flex-wrap:wrap;'>
+                    <button class='btn-secondary btn' onclick='refreshDevices()'>↻ Rescan devices</button>
+                    <button class='btn-secondary btn' onclick='addRow()'>＋ Add camera</button>
+                </div>
             </div>
+            <div id='device-list' style='margin:10px 0 12px;'></div>
             <div style='overflow-x:auto;'>
                 <table id='cam-table'>
                     <thead>
-                        <tr><th>ID</th><th>Name</th><th>Device</th><th>Port</th><th></th></tr>
+                        <tr><th>ID</th><th>Name</th><th>Device</th><th>Port</th><th>Width</th><th>Height</th><th>FPS</th><th></th></tr>
                     </thead>
                     <tbody></tbody>
                 </table>
@@ -537,6 +615,7 @@ def settings_page():
         <script>
             const tbody = document.querySelector('#cam-table tbody');
             const status = document.getElementById('status');
+            let devices = [];
 
             function setStatus(text, variant='muted') {
                 status.textContent = text;
@@ -544,16 +623,51 @@ def settings_page():
                 status.classList.add(variant);
             }
 
-            function addRow(cam={id:'', name:'', device:'', port:''}) {
+            function renderDeviceOptions(currentDevice) {
+                if (!devices.length) {
+                    const val = currentDevice ?? '';
+                    return `<option value="${val}">${val === '' ? 'Enter a device number' : 'Device ' + val}</option>`;
+                }
+
+                const options = devices.map(dev => {
+                    const disabled = dev.in_use && dev.index !== currentDevice;
+                    const res = (dev.resolution?.width && dev.resolution?.height)
+                        ? `${dev.resolution.width}×${dev.resolution.height}`
+                        : 'resolution unknown';
+                    const fpsText = dev.fps ? ` · ${dev.fps.toFixed(1)} fps` : '';
+                    return `<option value="${dev.index}" ${dev.index === currentDevice ? 'selected' : ''} ${disabled ? 'disabled' : ''}>${dev.index} · ${res}${fpsText}${dev.in_use && dev.index !== currentDevice ? ' (in use)' : ''}</option>`;
+                }).join('');
+
+                const fallback = (currentDevice !== null && currentDevice !== '' && !devices.some(d => d.index === currentDevice))
+                    ? `<option value="${currentDevice}" selected>Device ${currentDevice}</option>`
+                    : '';
+
+                return `<option value="">Select device…</option>${options}${fallback}`;
+            }
+
+            function updateDeviceSelects() {
+                const selects = tbody.querySelectorAll('select.device-select');
+                selects.forEach(sel => {
+                    const currentVal = sel.value === '' ? '' : Number(sel.value);
+                    sel.innerHTML = renderDeviceOptions(Number.isNaN(currentVal) ? '' : currentVal);
+                    sel.value = sel.dataset.current = sel.value || (Number.isNaN(currentVal) ? '' : currentVal);
+                });
+            }
+
+            function addRow(cam={id:'', name:'', device:'', port:'', width:'', height:'', fps:''}) {
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
                     <td><input class='input' value='${cam.id}' placeholder='cam1'></td>
                     <td><input class='input' value='${cam.name}' placeholder='USB Cam'></td>
-                    <td><input class='input' value='${cam.device}' type='number' min='0' style='width:90px'></td>
+                    <td><select class='input device-select' data-current='${cam.device ?? ''}'></select></td>
                     <td><input class='input' value='${cam.port ?? ''}' type='number' min='0' style='width:100px'></td>
-                    <td style='width:60px; text-align:right;'><button class='btn-secondary btn' onclick='this.closest("tr").remove()'>✖</button></td>
+                    <td><input class='input' value='${cam.width ?? ''}' type='number' min='0' style='width:100px' placeholder='auto'></td>
+                    <td><input class='input' value='${cam.height ?? ''}' type='number' min='0' style='width:100px' placeholder='auto'></td>
+                    <td><input class='input' value='${cam.fps ?? ''}' type='number' min='0' step='0.1' style='width:100px' placeholder='auto'></td>
+                    <td style='width:60px; text-align:right;'><button class='btn-secondary btn' onclick='this.closest("tr").remove(); updateDeviceSelects();'>✖</button></td>
                 `;
                 tbody.appendChild(tr);
+                updateDeviceSelects();
             }
 
             async function loadConfig() {
@@ -563,10 +677,57 @@ def settings_page():
                     document.querySelector('#host').value = data.host || '';
                     tbody.innerHTML = '';
                     (data.cameras || []).forEach(addRow);
+                    await refreshDevices(false);
                     setStatus('Loaded configuration.');
                 } catch (err) {
                     setStatus('Failed to load configuration: ' + err, 'error');
                 }
+            }
+
+            async function refreshDevices(showStatus=true) {
+                if (showStatus) setStatus('Scanning for connected cameras…');
+                try {
+                    const res = await fetch('/api/devices');
+                    const data = await res.json();
+                    devices = data.devices || [];
+                    renderDeviceList();
+                    updateDeviceSelects();
+                    if (showStatus) setStatus('Camera scan complete.');
+                } catch (err) {
+                    if (showStatus) setStatus('Failed to scan devices: ' + err, 'error');
+                }
+            }
+
+            function renderDeviceList() {
+                const container = document.getElementById('device-list');
+                if (!devices.length) {
+                    container.innerHTML = '<p class="muted">No cameras detected. You can still enter a device number manually.</p>';
+                    return;
+                }
+
+                const rows = devices.map(dev => {
+                    const res = (dev.resolution?.width && dev.resolution?.height)
+                        ? `${dev.resolution.width}×${dev.resolution.height}`
+                        : 'unknown';
+                    const fps = dev.fps ? `${dev.fps.toFixed(1)} fps` : 'unknown';
+                    const dim = dev.in_use ? 'style="opacity:0.45;"' : '';
+                    const action = dev.in_use
+                        ? '<span class="pill" style="background:rgba(148,163,184,0.15); color:#cbd5e1; border-color:rgba(148,163,184,0.35);">In use</span>'
+                        : `<button class='btn-secondary btn' onclick='addFromDevice(${dev.index})'>Add</button>`;
+                    return `<tr ${dim}><td>${dev.index}</td><td>${res}</td><td>${fps}</td><td>${action}</td></tr>`;
+                }).join('');
+
+                container.innerHTML = `<table><thead><tr><th>Device</th><th>Resolution</th><th>FPS</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+            }
+
+            function addFromDevice(index) {
+                const existing = Array.from(tbody.querySelectorAll('tr')).some(row => {
+                    const deviceVal = row.querySelector('select.device-select')?.value;
+                    return deviceVal !== '' && Number(deviceVal) === index;
+                });
+                if (existing) return;
+                addRow({ id: `cam${index}`, name: `Camera ${index}`, device: index, port: '', width: '', height: '', fps: '' });
+                setStatus(`Added device ${index} to the table.`);
             }
 
             async function saveConfig() {
@@ -576,9 +737,15 @@ def settings_page():
                 const seenPorts = new Set();
 
                 const cameras = rows.map(r => {
-                    const [id,name,device,port] = Array.from(r.querySelectorAll('input')).map(i => i.value.trim());
+                    const inputs = Array.from(r.querySelectorAll('input'));
+                    const [id,name,port,width,height,fps] = inputs.map(i => i.value.trim());
+                    const deviceSelect = r.querySelector('select');
+                    const device = deviceSelect ? deviceSelect.value.trim() : '';
                     const deviceNum = device === '' ? NaN : Number(device);
                     const portNum = port === '' ? null : Number(port);
+                    const widthNum = width === '' ? null : Number(width);
+                    const heightNum = height === '' ? null : Number(height);
+                    const fpsNum = fps === '' ? null : Number(fps);
 
                     if (!id) errors.push('Camera ID is required.');
                     if (id && seenIds.has(id)) errors.push(`Duplicate camera id "${id}".`);
@@ -590,8 +757,11 @@ def settings_page():
                         if (seenPorts.has(portNum)) errors.push(`Port ${portNum} is duplicated.`);
                         seenPorts.add(portNum);
                     }
+                    if (widthNum !== null && (!Number.isFinite(widthNum) || widthNum <= 0)) errors.push(`Camera "${id || '(new)'}" width must be positive.`);
+                    if (heightNum !== null && (!Number.isFinite(heightNum) || heightNum <= 0)) errors.push(`Camera "${id || '(new)'}" height must be positive.`);
+                    if (fpsNum !== null && (!Number.isFinite(fpsNum) || fpsNum <= 0)) errors.push(`Camera "${id || '(new)'}" FPS must be positive.`);
 
-                    return { id, name, device: deviceNum, port: portNum };
+                    return { id, name, device: deviceNum, port: portNum, width: widthNum, height: heightNum, fps: fpsNum };
                 }).filter(c => c.id);
 
                 if (errors.length) {
@@ -642,7 +812,9 @@ def api_docs_page():
             <ul>
                 <li><code>GET /api/cameras</code> — returns the current host and camera list.</li>
                 <li><code>POST /api/cameras</code> — update host and cameras; regenerates nginx.cameras.conf and restarts capture.</li>
+                <li><code>GET /api/devices</code> — list detected video devices and whether they are already assigned.</li>
             </ul>
+            <p class='muted'>Camera fields: <code>id</code>, <code>name</code>, <code>device</code>, optional <code>port</code>, <code>width</code>, <code>height</code>, and <code>fps</code>.</p>
             <h3>Streaming</h3>
             <p class='muted'>Replace <code>{{cam_id}}</code> with a configured camera ID.</p>
             <ul>
@@ -658,6 +830,11 @@ def api_docs_page():
         </div>
     """
     return _base_page("API Docs · Pi Camera Server", "docs", body)
+
+
+@app.get("/api/devices")
+def list_devices():
+    return {"devices": discover_cameras()}
 
 
 @app.get("/api/cameras")
