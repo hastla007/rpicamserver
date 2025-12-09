@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 cameras.json
+nginx.cameras.conf
 
 # Virtualenvs
 .env
