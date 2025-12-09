@@ -21,6 +21,7 @@ Typical uses include:
 - Camera discovery endpoint to list connected devices and avoid assigning the same camera twice
 - Optional per-camera capture settings (resolution, FPS, brightness, exposure, and white balance)
 - Snapshot responses fall back to an inline "offline" placeholder instead of errors
+- Optional HTTP basic auth for configuration endpoints (toggleable in the Settings UI or JSON config)
 
 ## Getting started
 
@@ -48,6 +49,10 @@ devices on most Linux systems. Ports are auto-assigned starting at 8081 if
 omitted. You can also set `width`, `height`, and `fps` to request a specific
 capture resolution and frame rate for each camera, plus optional `brightness`,
 `exposure`, and `white_balance` controls when supported by the device driver.
+If you want to guard the Settings/API endpoints, include an `auth` block with
+`enabled`, `username`, and `password`. When enabled, the browser will prompt for
+credentials on `/settings`, `/api/cameras`, and `/api/devices` while the streaming
+endpoints remain open by default.
 
 ### Run the server
 Start the main FastAPI control plane (defaults to port 8000; override with
@@ -121,12 +126,18 @@ You can discover attached cameras (and which ones are already assigned) with
 - `GET /cam/{id}/video` – MJPEG video stream for camera `{id}`
 - `GET /cam/{id}/snapshot` – Single JPEG frame for camera `{id}`
 
+### Security
+
+- Basic auth (disabled by default) protects `/settings`, `/api/cameras`, and `/api/devices`. Configure it from the Settings page or by adding an `auth` block to `cameras.json`.
+- Streaming endpoints remain public; frontends or reverse proxies can add their own guards if needed.
+
 ### Logging and discovery controls
 
 - `LOG_DEST` (comma-separated) chooses logging sinks: `stdout`, `file`, `syslog`. Defaults to `stdout`. Provide `LOG_FILE` when including `file`.
 - `LOG_LEVEL` controls verbosity (defaults to `INFO`).
 - `MAX_DEVICE_PROBE` caps how many numeric device indices are probed when no `/dev/video*` entries are present (default `4`).
 - `PROBE_WHEN_NO_DEVICES` (true/false) toggles probing numeric indices when globbing finds nothing (default `false` to avoid CPU churn in containerized environments).
+- The Settings UI surfaces the probe toggle and limit so you can avoid deep scans on systems without `/dev/video*` entries.
 
 ## Testing and CI
 
@@ -178,7 +189,8 @@ case it addresses.
 - Streaming endpoints are async-based so multiple clients can connect without
   blocking, and capture threads pause when no subscribers are connected to save
   CPU.
-- Snapshots return an inline placeholder JPEG when a camera is offline instead
-  of a 503 error, which keeps dashboards from breaking while devices reconnect.
+- Snapshots return an inline placeholder JPEG (respecting the configured
+  resolution where possible) when a camera is offline instead of a 503 error,
+  which keeps dashboards from breaking while devices reconnect.
 - Logging destinations are configurable via `LOG_DEST`; syslog is only enabled when requested and `/dev/log` is reachable.
 - You can also run `python app.py` to start uvicorn with default settings.

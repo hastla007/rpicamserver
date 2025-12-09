@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from fastapi import HTTPException
+from fastapi.security import HTTPBasicCredentials
 import pytest
 
 import app
@@ -87,3 +88,18 @@ def test_invalid_camera_post_returns_error():
 
     assert exc.value.status_code == 400
     assert "Duplicate camera id" in exc.value.detail
+
+
+def test_require_auth_guard(monkeypatch):
+    app.CAMERA_CONFIG = {
+        "host": "0.0.0.0",
+        "auth": {"enabled": True, "username": "user", "password": "pass"},
+        "cameras": [],
+    }
+
+    ok = HTTPBasicCredentials(username="user", password="pass")
+    assert app.require_auth(ok) is None
+
+    bad = HTTPBasicCredentials(username="user", password="nope")
+    with pytest.raises(HTTPException):
+        app.require_auth(bad)

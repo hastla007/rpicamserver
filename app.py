@@ -14,6 +14,7 @@ import glob
 import json
 import logging
 import os
+import secrets
 import threading
 import time
 from logging.handlers import SysLogHandler
@@ -23,8 +24,9 @@ from typing import Any, Dict, List, Optional
 import cv2
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 
 CONFIG_PATH = Path("cameras.json")
@@ -39,6 +41,7 @@ MAX_DEVICE_PROBE = int(os.getenv("MAX_DEVICE_PROBE", "4"))
 PROBE_WHEN_NO_DEVICES = os.getenv("PROBE_WHEN_NO_DEVICES", "false").lower() == "true"
 
 logger = logging.getLogger("rpicamserver")
+security = HTTPBasic(auto_error=False)
 
 
 class SafeSysLogHandler(SysLogHandler):
@@ -251,10 +254,22 @@ def _encode_frame(frame, quality: int = 80) -> Optional[bytes]:
     return jpeg.tobytes()
 
 
-def _offline_placeholder(cam_id: str) -> bytes:
-    """Return a small JPEG indicating the camera is offline."""
+def _offline_placeholder(cam_id: str, width: Optional[int] = None, height: Optional[int] = None) -> bytes:
+    """Return a small JPEG indicating the camera is offline.
 
-    canvas = np.zeros((240, 320, 3), dtype=np.uint8)
+    The placeholder attempts to respect the configured resolution so the aspect ratio
+    matches the expected stream size when possible.
+    """
+
+    base_width = width or 320
+    base_height = height or 240
+
+    if width and not height:
+        base_height = max(1, int(width * 3 / 4))
+    if height and not width:
+        base_width = max(1, int(height * 4 / 3))
+
+    canvas = np.zeros((base_height, base_width, 3), dtype=np.uint8)
     canvas[:] = (28, 35, 52)
     cv2.putText(
         canvas,
@@ -270,13 +285,30 @@ def _offline_placeholder(cam_id: str) -> bytes:
     return placeholder or b""
 
 
+def _configured_resolution(cam_id: str) -> tuple[Optional[int], Optional[int]]:
+    cfg = next((c for c in CAMERA_CONFIG.get("cameras", []) if c.get("id") == cam_id), {})
+    width = cfg.get("width")
+    height = cfg.get("height")
+
+    camera = CAMERAS.get(cam_id)
+    if camera:
+        width = width or camera.width
+        height = height or camera.height
+
+    return width, height
+
+
 ###############################################################################
 # Configuration
 ###############################################################################
 
 
 def default_config() -> Dict[str, Any]:
-    return {"host": DEFAULT_CAMERA_HOST, "cameras": []}
+    return {
+        "host": DEFAULT_CAMERA_HOST,
+        "auth": {"enabled": False, "username": "", "password": ""},
+        "cameras": [],
+    }
 
 
 def validate_camera_entries(cameras: List[Dict[str, Any]]) -> None:
@@ -333,13 +365,37 @@ def validate_camera_entries(cameras: List[Dict[str, Any]]) -> None:
         seen_ids.add(cam_id)
 
 
+def validate_auth(auth_cfg: Dict[str, Any]) -> None:
+    if not auth_cfg:
+        return
+
+    enabled = bool(auth_cfg.get("enabled"))
+    username = str(auth_cfg.get("username", "")).strip()
+    password = str(auth_cfg.get("password", "")).strip()
+
+    if enabled and (not username or not password):
+        raise ValueError("Auth is enabled but username or password is missing.")
+
+    if not enabled:
+        auth_cfg["username"] = ""
+        auth_cfg["password"] = ""
+
+
 def load_config() -> Dict[str, Any]:
     if CONFIG_PATH.exists():
         config = json.loads(CONFIG_PATH.read_text())
     else:
         config = default_config()
 
+    if "auth" not in config:
+        config["auth"] = default_config()["auth"].copy()
+
     assigned_cameras = assign_ports(config.get("cameras", []))
+    try:
+        validate_auth(config.get("auth", {}))
+    except ValueError as exc:  # noqa: BLE001
+        logger.warning("Invalid auth configuration: %s. Disabling auth.", exc)
+        config["auth"] = default_config()["auth"].copy()
     try:
         validate_camera_entries(assigned_cameras)
     except ValueError as exc:  # noqa: BLE001
@@ -456,9 +512,9 @@ def discover_cameras(
                 },
                 "fps": fps or None,
                 "controls": {
-                    "brightness": brightness if brightness else None,
-                    "exposure": exposure if exposure else None,
-                    "white_balance": white_balance if white_balance else None,
+                    "brightness": brightness if brightness is not None else None,
+                    "exposure": exposure if exposure is not None else None,
+                    "white_balance": white_balance if white_balance is not None else None,
                 },
             }
         )
@@ -520,9 +576,16 @@ class CameraConfig(BaseModel):
     )
 
 
+class AuthConfig(BaseModel):
+    enabled: bool = Field(default=False, description="Enable HTTP basic auth")
+    username: str = Field(default="", description="Basic auth username")
+    password: str = Field(default="", description="Basic auth password")
+
+
 class CamerasUpdate(BaseModel):
     host: str = Field(default=DEFAULT_CAMERA_HOST, description="Binding host")
     cameras: List[CameraConfig]
+    auth: AuthConfig = Field(default_factory=AuthConfig)
 
 
 ###############################################################################
@@ -532,6 +595,41 @@ class CamerasUpdate(BaseModel):
 
 CAMERAS: Dict[str, Camera] = {}
 CAMERA_CONFIG: Dict[str, Any] = default_config()
+
+
+def _auth_enabled() -> bool:
+    auth_cfg = CAMERA_CONFIG.get("auth", {})
+    return bool(
+        auth_cfg
+        and auth_cfg.get("enabled")
+        and auth_cfg.get("username")
+        and auth_cfg.get("password")
+    )
+
+
+def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)) -> None:
+    if not _auth_enabled():
+        return
+
+    expected_user = CAMERA_CONFIG.get("auth", {}).get("username", "")
+    expected_pass = CAMERA_CONFIG.get("auth", {}).get("password", "")
+
+    if not credentials or not credentials.username:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    if not (
+        secrets.compare_digest(credentials.username, expected_user)
+        and secrets.compare_digest(credentials.password or "", expected_pass)
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
 
 
 def stop_cameras() -> None:
@@ -608,14 +706,17 @@ async def mjpeg_generator(cam_id: str):
 def get_snapshot_bytes(cam_id: str) -> bytes:
     if cam_id not in CAMERAS:
         raise HTTPException(status_code=404, detail="Camera not found")
-    frame = CAMERAS[cam_id].get_frame(wait=True, timeout=1.5)
+    camera = CAMERAS[cam_id]
+    frame = camera.get_frame(wait=True, timeout=1.5)
     if frame is None:
         logger.warning("No frame available for %s; returning placeholder.", cam_id)
-        return _offline_placeholder(cam_id)
+        target_width, target_height = _configured_resolution(cam_id)
+        return _offline_placeholder(cam_id, width=target_width, height=target_height)
 
     jpg_bytes = _encode_frame(frame, quality=90)
     if jpg_bytes is None:
-        placeholder = _offline_placeholder(cam_id)
+        target_width, target_height = _configured_resolution(cam_id)
+        placeholder = _offline_placeholder(cam_id, width=target_width, height=target_height)
         if placeholder:
             return placeholder
         raise HTTPException(status_code=500, detail="Failed to encode frame")
@@ -836,7 +937,7 @@ def index_page():
     return _base_page("Pi Camera Server", "home", body)
 
 
-@app.get("/settings", response_class=HTMLResponse)
+@app.get("/settings", response_class=HTMLResponse, dependencies=[Depends(require_auth)])
 def settings_page():
     body = """
         <div class='card'>
@@ -852,6 +953,17 @@ def settings_page():
                 <label class='muted'>Binding host</label>
                 <input class='input' id='host' placeholder='0.0.0.0'>
             </div>
+            <div style='margin-top:16px; display:flex; flex-direction:column; gap:6px;'>
+                <div style='display:flex; gap:12px; flex-wrap:wrap; align-items:center;'>
+                    <label class='muted'>Authentication (optional)</label>
+                    <label style='display:flex; gap:6px; align-items:center;'><input type='checkbox' id='auth-enabled'> Require basic auth for settings/API</label>
+                </div>
+                <div style='display:flex; gap:10px; flex-wrap:wrap;'>
+                    <input class='input' id='auth-username' placeholder='admin' style='max-width:160px;'>
+                    <input class='input' id='auth-password' type='password' placeholder='password' style='max-width:180px;'>
+                </div>
+                <p class='muted' style='margin:0;'>If enabled, browsers will prompt for these credentials on configuration endpoints.</p>
+            </div>
             <div style='margin-top:16px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;'>
                 <div>
                     <h3 style='margin:0;'>Cameras</h3>
@@ -861,6 +973,11 @@ def settings_page():
                     <button class='btn-secondary btn' onclick='refreshDevices()'>↻ Rescan devices</button>
                     <button class='btn-secondary btn' onclick='addRow()'>＋ Add camera</button>
                 </div>
+            </div>
+            <div style='margin:10px 0; display:flex; gap:12px; align-items:center; flex-wrap:wrap;'>
+                <label style='display:flex; gap:6px; align-items:center;'><input type='checkbox' id='probe-missing'> Probe missing indices when no /dev/video* entries</label>
+                <label class='muted' style='display:flex; gap:6px; align-items:center;'>Max probe <input class='input' id='probe-limit' type='number' min='0' style='width:80px;'></label>
+                <p class='muted' style='margin:0;'>Tuned by PROBE_WHEN_NO_DEVICES / MAX_DEVICE_PROBE.</p>
             </div>
             <div id='device-list' style='margin:10px 0 12px;'></div>
             <div style='overflow-x:auto;'>
@@ -876,12 +993,36 @@ def settings_page():
         <script>
             const tbody = document.querySelector('#cam-table tbody');
             const status = document.getElementById('status');
+            const authEnabled = document.getElementById('auth-enabled');
+            const authUser = document.getElementById('auth-username');
+            const authPass = document.getElementById('auth-password');
+            const probeMissingEl = document.getElementById('probe-missing');
+            const probeLimitEl = document.getElementById('probe-limit');
             let devices = [];
+
+            const defaultProbeMissing = __PROBE_MISSING__;
+            const defaultProbeLimit = __PROBE_LIMIT__;
+            probeMissingEl.checked = defaultProbeMissing;
+            probeLimitEl.value = defaultProbeLimit;
 
             function setStatus(text, variant='muted') {
                 status.textContent = text;
                 status.classList.remove('error', 'success', 'muted');
                 status.classList.add(variant);
+            }
+
+            function buildAuthHeaders() {
+                if (!authEnabled.checked) return {};
+                const user = authUser.value.trim();
+                const pass = authPass.value;
+                if (!user || !pass) return {};
+                return { 'Authorization': 'Basic ' + btoa(`${user}:${pass}`) };
+            }
+
+            function currentProbeParams() {
+                const maxVal = Number(probeLimitEl.value);
+                const limit = Number.isFinite(maxVal) && maxVal > 0 ? maxVal : defaultProbeLimit;
+                return { max: limit, probe_missing: probeMissingEl.checked };
             }
 
             function renderDeviceOptions(currentDevice) {
@@ -936,9 +1077,13 @@ def settings_page():
 
             async function loadConfig() {
                 try {
-                    const res = await fetch('/api/cameras');
+                    const res = await fetch('/api/cameras', { headers: buildAuthHeaders() });
                     const data = await res.json();
                     document.querySelector('#host').value = data.host || '';
+                    const authCfg = data.auth || {};
+                    authEnabled.checked = !!authCfg.enabled;
+                    authUser.value = authCfg.username || '';
+                    authPass.value = authCfg.password || '';
                     tbody.innerHTML = '';
                     (data.cameras || []).forEach(addRow);
                     await refreshDevices(false);
@@ -951,7 +1096,8 @@ def settings_page():
             async function refreshDevices(showStatus=true) {
                 if (showStatus) setStatus('Scanning for connected cameras…');
                 try {
-                    const res = await fetch('/api/devices');
+                    const params = new URLSearchParams(currentProbeParams());
+                    const res = await fetch('/api/devices?' + params.toString(), { headers: buildAuthHeaders() });
                     const data = await res.json();
                     devices = data.devices || [];
                     renderDeviceList();
@@ -1005,6 +1151,15 @@ def settings_page():
                 const errors = [];
                 const seenIds = new Set();
                 const seenPorts = new Set();
+                const authCfg = {
+                    enabled: authEnabled.checked,
+                    username: authUser.value.trim(),
+                    password: authPass.value,
+                };
+
+                if (authCfg.enabled && (!authCfg.username || !authCfg.password)) {
+                    errors.push('Auth is enabled but username/password are missing.');
+                }
 
                 const cameras = rows.map(r => {
                     const inputs = Array.from(r.querySelectorAll('input'));
@@ -1045,12 +1200,13 @@ def settings_page():
                     return;
                 }
 
-                const payload = { host: document.getElementById('host').value || '0.0.0.0', cameras };
+                const payload = { host: document.getElementById('host').value || '0.0.0.0', cameras, auth: authCfg };
                 setStatus('Saving…');
                 try {
+                    const headers = { 'Content-Type': 'application/json', ...buildAuthHeaders() };
                     const res = await fetch('/api/cameras', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers,
                         body: JSON.stringify(payload),
                     });
                     if (!res.ok) throw new Error((await res.json()).detail || await res.text());
@@ -1065,10 +1221,12 @@ def settings_page():
             loadConfig();
         </script>
     """
+    body = body.replace("__PROBE_MISSING__", str(PROBE_WHEN_NO_DEVICES).lower())
+    body = body.replace("__PROBE_LIMIT__", str(MAX_DEVICE_PROBE))
     return _base_page("Settings · Pi Camera Server", "settings", body)
 
 
-@app.get("/api-docs", response_class=HTMLResponse)
+@app.get("/api-docs", response_class=HTMLResponse, dependencies=[Depends(require_auth)])
 def api_docs_page():
     host = CAMERA_CONFIG.get("host", DEFAULT_CAMERA_HOST)
     rows = []
@@ -1090,6 +1248,7 @@ def api_docs_page():
                 <li><code>POST /api/cameras</code> — update host and cameras; regenerates nginx.cameras.conf and restarts capture.</li>
                 <li><code>GET /api/devices</code> — list detected video devices and whether they are already assigned.</li>
             </ul>
+            <p class='muted'>Optional basic auth (configured in Settings) secures these endpoints and the Settings/API Docs pages; streams remain open by default.</p>
             <p class='muted'>Camera fields: <code>id</code>, <code>name</code>, <code>device</code>, optional <code>port</code>, <code>width</code>, <code>height</code>, <code>fps</code>, and optional controls <code>brightness</code>, <code>exposure</code>, <code>white_balance</code>.</p>
             <h3>Streaming</h3>
             <p class='muted'>Replace <code>{{cam_id}}</code> with a configured camera ID.</p>
@@ -1109,7 +1268,7 @@ def api_docs_page():
     return _base_page("API Docs · Pi Camera Server", "docs", body)
 
 
-@app.get("/api/devices")
+@app.get("/api/devices", dependencies=[Depends(require_auth)])
 def list_devices(max: Optional[int] = None, probe_missing: Optional[bool] = None):  # noqa: A002
     return {
         "devices": discover_cameras(
@@ -1118,21 +1277,26 @@ def list_devices(max: Optional[int] = None, probe_missing: Optional[bool] = None
     }
 
 
-@app.get("/api/cameras")
+@app.get("/api/cameras", dependencies=[Depends(require_auth)])
 def get_cameras():
     return CAMERA_CONFIG
 
 
-@app.post("/api/cameras")
+@app.post("/api/cameras", dependencies=[Depends(require_auth)])
 def set_cameras(data: CamerasUpdate):
     global CAMERA_CONFIG
     camera_dicts = [cam.model_dump() for cam in data.cameras]
     try:
+        validate_auth(data.auth.model_dump())
         validate_camera_entries(camera_dicts)
     except ValueError as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    CAMERA_CONFIG = {"host": data.host, "cameras": assign_ports(camera_dicts)}
+    CAMERA_CONFIG = {
+        "host": data.host,
+        "auth": data.auth.model_dump(),
+        "cameras": assign_ports(camera_dicts),
+    }
     save_config(CAMERA_CONFIG)
     init_cameras()
     generate_nginx_config(CAMERA_CONFIG)

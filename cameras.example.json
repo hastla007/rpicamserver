@@ -1,5 +1,6 @@
 {
   "host": "0.0.0.0",
+  "auth": {"enabled": false, "username": "", "password": ""},
   "cameras": [
     {
       "id": "cam1",

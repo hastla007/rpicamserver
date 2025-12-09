@@ -45,6 +45,60 @@ def test_snapshot_placeholder_when_no_frame(device_registry):
     assert data
 
 
+def test_discover_preserves_zero_controls(monkeypatch, device_registry):
+    props = {
+        app.cv2.CAP_PROP_BRIGHTNESS: 0,
+        app.cv2.CAP_PROP_EXPOSURE: 0,
+        app.cv2.CAP_PROP_WB_TEMPERATURE: 0,
+    }
+    device_registry[0] = {"frames": [b"frame"], "properties": props}
+    monkeypatch.setattr(app.glob, "glob", lambda *_: ["/dev/video0"])
+
+    devices = app.discover_cameras()
+    assert devices[0]["controls"] == {
+        "brightness": 0.0,
+        "exposure": 0.0,
+        "white_balance": 0.0,
+    }
+
+
+def test_placeholder_uses_config_resolution(monkeypatch):
+    shapes = []
+
+    def capture_shape(frame, quality=80):  # noqa: ARG001
+        shapes.append(frame.shape[:2])
+        return b"jpeg"
+
+    monkeypatch.setattr(app, "_encode_frame", capture_shape)
+    app.CAMERA_CONFIG = {
+        "host": "0.0.0.0",
+        "auth": app.default_config()["auth"],
+        "cameras": [
+            {
+                "id": "camx",
+                "name": "One",
+                "device": 0,
+                "port": 8081,
+                "width": 640,
+                "height": 360,
+            }
+        ],
+    }
+
+    class DummyCam:
+        width = 640
+        height = 360
+
+        @staticmethod
+        def get_frame(wait=False, timeout=0):  # noqa: ARG002
+            return None
+
+    app.CAMERAS = {"camx": DummyCam()}
+    data = app.get_snapshot_bytes("camx")
+    assert data == b"jpeg"
+    assert shapes[-1] == (360, 640)
+
+
 async def test_mjpeg_generator_tracks_subscribers(device_registry, sample_frame):
     device_registry[0] = {"frames": [sample_frame for _ in range(5)]}
     cam = app.Camera(0)
