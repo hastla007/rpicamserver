@@ -22,6 +22,7 @@ Typical uses include:
 - Optional per-camera capture settings (resolution, FPS, brightness, exposure, and white balance)
 - Snapshot responses fall back to an inline "offline" placeholder instead of errors
 - Optional HTTP basic auth for configuration endpoints (toggleable in the Settings UI or JSON config)
+- Manual restart button per camera on the dashboard plus a `POST /api/cameras/{id}/restart` endpoint for recovery
 - /health endpoint plus Prometheus-style /metrics gauges for availability, subscribers, and frame ages
 
 ## Getting started
@@ -138,6 +139,7 @@ You can discover attached cameras (and which ones are already assigned) with
 - `GET /cam/{id}/snapshot` – Single JPEG frame for camera `{id}`
 - `GET /health` – JSON status of each configured camera (online/offline/stale with last-frame ages)
 - `GET /metrics` – Prometheus-style gauges for camera availability and subscriber counts
+- `POST /api/cameras/{id}/restart` – request a manual reopen for a camera that is offline or stale
 
 Camera control ranges: brightness expects `0.0–1.0`, exposure `0–10000` (device-specific), and white balance `0–12000` Kelvin (0 usually means auto). Leave them blank for auto, and the server will reject values outside these bounds with a combined error message.
 
@@ -153,7 +155,7 @@ Camera control ranges: brightness expects `0.0–1.0`, exposure `0–10000` (dev
 - `CAMERA_RETRY_INTERVAL` controls how often a failed camera reopen is attempted (seconds, default `30`). Offline cameras stay routable and return placeholders until they recover.
 - `MAX_DEVICE_PROBE` caps how many numeric device indices are probed when no `/dev/video*` entries are present (default `4`).
 - `PROBE_WHEN_NO_DEVICES` (true/false) toggles probing numeric indices when globbing finds nothing (default `false` to avoid CPU churn in containerized environments).
-- The Settings UI surfaces the probe toggle and limit so you can avoid deep scans on systems without `/dev/video*` entries.
+- The Settings UI surfaces the probe toggle and limit so you can avoid deep scans on systems without `/dev/video*` entries, and it skips auto-probing when the defaults disable it.
 
 ## Testing and CI
 

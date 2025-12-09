@@ -118,6 +118,24 @@ def test_invalid_camera_post_returns_error():
     assert "Duplicate camera id" in exc.value.detail
 
 
+def test_invalid_auth_is_reported(tmp_path, monkeypatch):
+    config_path = tmp_path / "cameras.json"
+    monkeypatch.setattr(app, "CONFIG_PATH", config_path)
+    config_path.write_text(
+        json.dumps(
+            {
+                "host": "0.0.0.0",
+                "auth": {"enabled": True, "username": "", "password": ""},
+                "cameras": [],
+            }
+        )
+    )
+
+    cfg = app.load_config()
+    assert cfg.get("auth_error")
+    assert cfg["auth"].get("enabled") is False
+
+
 def test_require_auth_guard(monkeypatch):
     app.CAMERA_CONFIG = {
         "host": "0.0.0.0",

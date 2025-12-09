@@ -197,6 +197,10 @@ class Camera:
         if zero:
             self.idle_event.set()
 
+    def request_restart(self) -> None:
+        self.next_retry_ts = 0
+        self.idle_event.set()
+
     def _subscriber_count(self) -> int:
         with self.subscriber_lock:
             return self.active_subscribers
@@ -440,10 +444,6 @@ def validate_auth(auth_cfg: Dict[str, Any]) -> None:
     if enabled and (not username or not password):
         raise ValueError("Auth is enabled but username or password is missing.")
 
-    if not enabled:
-        auth_cfg["username"] = ""
-        auth_cfg["password"] = ""
-
 
 def load_config() -> Dict[str, Any]:
     if CONFIG_PATH.exists():
@@ -457,9 +457,12 @@ def load_config() -> Dict[str, Any]:
     assigned_cameras = assign_ports(config.get("cameras", []))
     try:
         validate_auth(config.get("auth", {}))
+        config.pop("auth_error", None)
     except ValueError as exc:  # noqa: BLE001
-        logger.warning("Invalid auth configuration: %s. Disabling auth.", exc)
-        config["auth"] = default_config()["auth"].copy()
+        config["auth_error"] = str(exc)
+        if config.get("auth"):
+            config["auth"]["enabled"] = False
+        logger.error("Invalid auth configuration: %s", exc)
     try:
         validate_camera_entries(assigned_cameras)
     except ValueError as exc:  # noqa: BLE001
@@ -702,6 +705,41 @@ def stop_cameras() -> None:
             camera.stop()
     CAMERAS.clear()
     CAMERA_STATUS.clear()
+
+
+def restart_camera(cam_id: str) -> Dict[str, Any]:
+    cam_cfg = next((c for c in CAMERA_CONFIG.get("cameras", []) if c.get("id") == cam_id), None)
+    if not cam_cfg:
+        raise HTTPException(status_code=404, detail="Camera not configured")
+
+    camera = CAMERAS.get(cam_id)
+    if camera:
+        camera.request_restart()
+        return {"status": "restarting"}
+
+    # Attempt to create a new camera instance if the previous one failed to open
+    try:
+        new_cam = Camera(
+            cam_id,
+            cam_cfg["device"],
+            width=cam_cfg.get("width"),
+            height=cam_cfg.get("height"),
+            fps=cam_cfg.get("fps"),
+            brightness=cam_cfg.get("brightness"),
+            exposure=cam_cfg.get("exposure"),
+            white_balance=cam_cfg.get("white_balance"),
+        )
+        CAMERAS[cam_id] = new_cam
+        return {"status": "restarted"}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Manual restart failed for %s: %s", cam_id, exc)
+        CAMERA_STATUS[cam_id] = {
+            "state": "offline",
+            "message": str(exc),
+            "device": cam_cfg.get("device"),
+        }
+        CAMERAS[cam_id] = None  # type: ignore[assignment]
+        raise HTTPException(status_code=503, detail=f"Restart failed: {exc}")
 
 
 def init_cameras() -> None:
@@ -1026,7 +1064,10 @@ def index_page():
                         <h3 style='margin:8px 0 4px;'>{name}</h3>
                         <p class='muted'>Device index: {cam['device']}</p>
                         <p class='muted'>Capture: {res_text}</p>
-                        <div class='pill status-pill muted' data-cam='{cam_id}' aria-live='polite'>Status: checking…</div>
+                        <div style='display:flex; gap:8px; align-items:center; flex-wrap:wrap;'>
+                            <div class='pill status-pill muted' data-cam='{cam_id}' aria-live='polite'>Status: checking…</div>
+                            <button class='btn-secondary btn' style='padding:6px 10px; box-shadow:none;' onclick="retryCamera('{cam_id}')">Retry</button>
+                        </div>
                     </div>
                     <div style='text-align:right;'>
                         <div class='muted'>Port</div>
@@ -1057,6 +1098,19 @@ def index_page():
             {''.join(cards) if cards else '<div class="card"><p>No cameras configured yet. Add one in Settings.</p></div>'}
         </div>
         <script>
+            async function retryCamera(camId) {{
+                try {{
+                    const res = await fetch(`/api/cameras/${{camId}}/restart`, {{ method: 'POST' }});
+                    if (!res.ok) {{
+                        const err = await res.text();
+                        throw new Error(err || 'Restart failed');
+                    }}
+                }} catch (err) {{
+                    console.error('Retry failed', err);
+                    alert('Retry failed: ' + err);
+                }}
+            }}
+
             setInterval(() => {{
                 const imgs = document.querySelectorAll("img[id^='snap-']");
                 imgs.forEach(img => {{
@@ -1130,7 +1184,7 @@ def settings_page():
             <div style='margin:10px 0; display:flex; gap:12px; align-items:center; flex-wrap:wrap;'>
                 <label style='display:flex; gap:6px; align-items:center;'><input type='checkbox' id='probe-missing'> Probe missing indices when no /dev/video* entries</label>
                 <label class='muted' style='display:flex; gap:6px; align-items:center;'>Max probe <input class='input' id='probe-limit' type='number' min='0' style='width:80px;'></label>
-                <p class='muted' style='margin:0;'>Tuned by PROBE_WHEN_NO_DEVICES / MAX_DEVICE_PROBE.</p>
+                <p class='muted' style='margin:0;'>Leave unchecked to avoid probing in headless/virtual environments.</p>
             </div>
             <div id='device-list' style='margin:10px 0 12px;'></div>
             <div style='overflow-x:auto;'>
@@ -1141,6 +1195,7 @@ def settings_page():
                     <tbody></tbody>
                 </table>
             </div>
+            <p class='muted' style='margin:10px 0 0;'>Brightness 0.0–1.0 · Exposure 0–10,000 · White balance 0–12,000 (Kelvin). Leave blank for camera defaults.</p>
             <div id='status' class='status muted'></div>
         </div>
         <script>
@@ -1239,14 +1294,20 @@ def settings_page():
                     authPass.value = authCfg.password || '';
                     tbody.innerHTML = '';
                     (data.cameras || []).forEach(addRow);
-                    await refreshDevices(false);
+                    await refreshDevices(false, true);
                     setStatus('Loaded configuration.');
                 } catch (err) {
                     setStatus('Failed to load configuration: ' + err, 'error');
                 }
             }
 
-            async function refreshDevices(showStatus=true) {
+            async function refreshDevices(showStatus=true, allowSkip=false) {
+                if (!allowSkip && !probeMissingEl.checked && !defaultProbeMissing && !devices.length) {
+                    renderDeviceList();
+                    updateDeviceSelects();
+                    if (showStatus) setStatus('Discovery skipped. Enable probing to scan indices.', 'muted');
+                    return;
+                }
                 if (showStatus) setStatus('Scanning for connected cameras…');
                 try {
                     const params = new URLSearchParams(currentProbeParams());
@@ -1456,6 +1517,11 @@ def set_cameras(data: CamerasUpdate):
     init_cameras()
     generate_nginx_config(CAMERA_CONFIG)
     return {"status": "ok", "cameras": CAMERA_CONFIG}
+
+
+@app.post("/api/cameras/{cam_id}/restart")
+def restart_camera_endpoint(cam_id: str):
+    return restart_camera(cam_id)
 
 
 @app.get("/health")
