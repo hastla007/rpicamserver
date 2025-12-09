@@ -273,54 +273,307 @@ def shutdown_event() -> None:
     stop_cameras()
 
 
-@app.get("/", response_class=HTMLResponse)
-def index_page():
-    cam_list_html = ""
-    host = CAMERA_CONFIG.get("host", DEFAULT_CAMERA_HOST)
-    for cam in CAMERA_CONFIG.get("cameras", []):
-        cam_id = cam["id"]
-        port = cam.get("port", "")
-        cam_list_html += f"""
-        <div style='margin-bottom: 20px;'>
-            <h3>{cam_id} - {cam['name']}</h3>
-            <div>
-                Nginx-mapped endpoints on port {port}:<br>
-                <code>http://{host}:{port}/</code> → video<br>
-                <code>http://{host}:{port}/snapshot</code> → snapshot
-            </div>
-            <div style='margin-top: 10px;'>
-                Video (main API):<br>
-                <img src='/cam/{cam_id}/video' style='max-width: 480px; border: 1px solid #ccc;'>
-            </div>
-            <div style='margin-top: 10px;'>
-                Snapshot (main API):<br>
-                <img id='snap-{cam_id}' src='/cam/{cam_id}/snapshot' style='max-width: 320px; border: 1px solid #ccc;'>
-            </div>
-        </div>
-        """
+def _base_page(title: str, active: str, body: str) -> str:
+    nav_items = {
+        "home": ("/", "Cameras"),
+        "settings": ("/settings", "Settings"),
+        "docs": ("/api-docs", "API Docs"),
+    }
 
-    return f"""
+    nav_html = "".join(
+        f"<a class='nav-link {'active' if key == active else ''}' href='{href}'>"
+        f"{label}</a>" for key, (href, label) in nav_items.items()
+    )
+
+    template = """
     <html>
     <head>
-        <title>Pi Camera Server</title>
-        <meta charset="utf-8" />
+        <title>__TITLE__</title>
+        <meta charset=\"utf-8\" />
+        <style>
+            :root {
+                color-scheme: light dark;
+                --bg: #0f172a;
+                --panel: #111827;
+                --accent: #3b82f6;
+                --text: #e5e7eb;
+                --muted: #94a3b8;
+                --border: #1f2937;
+                font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            }
+            body {
+                margin: 0 auto;
+                max-width: 1100px;
+                padding: 24px 16px 48px;
+                color: var(--text);
+                background: linear-gradient(180deg, #0b1224 0%, #0f172a 35%, #0f172a 100%);
+            }
+            h1 { margin: 0 0 16px; letter-spacing: -0.02em; }
+            p { color: var(--muted); }
+            .nav {
+                display: flex;
+                gap: 12px;
+                margin: 16px 0 24px;
+                border-bottom: 1px solid var(--border);
+                padding-bottom: 10px;
+            }
+            .nav-link {
+                color: var(--muted);
+                text-decoration: none;
+                padding: 8px 12px;
+                border-radius: 8px;
+                transition: background 0.15s, color 0.15s;
+            }
+            .nav-link:hover { color: var(--text); background: #111827; }
+            .nav-link.active {
+                background: rgba(59, 130, 246, 0.15);
+                color: #bfdbfe;
+                border: 1px solid rgba(59, 130, 246, 0.4);
+            }
+            .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+            .card {
+                background: var(--panel);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 16px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+            }
+            .pill {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                background: rgba(59, 130, 246, 0.1);
+                color: #bfdbfe;
+                padding: 6px 10px;
+                border-radius: 999px;
+                font-size: 12px;
+                border: 1px solid rgba(59,130,246,0.25);
+            }
+            code { background: rgba(255,255,255,0.04); padding: 2px 4px; border-radius: 6px; }
+            .btn {
+                background: var(--accent);
+                color: white;
+                padding: 10px 14px;
+                border-radius: 10px;
+                border: none;
+                cursor: pointer;
+                font-weight: 600;
+                box-shadow: 0 10px 30px rgba(59,130,246,0.25);
+            }
+            .btn-secondary {
+                background: #1f2937;
+                color: var(--text);
+                border: 1px solid var(--border);
+            }
+            .input, select {
+                width: 100%;
+                padding: 10px 12px;
+                border-radius: 10px;
+                border: 1px solid var(--border);
+                background: #0b1224;
+                color: var(--text);
+            }
+            table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+            th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); }
+            .muted { color: var(--muted); font-size: 14px; }
+            .status { margin-top: 12px; font-weight: 600; }
+            a { color: #93c5fd; }
+        </style>
     </head>
     <body>
         <h1>Pi Camera Server</h1>
-        <p>Streams are available both from this API and on per-camera ports.</p>
-        {cam_list_html or '<p>No cameras configured. POST to /api/cameras to add one.</p>'}
-        <script>
-        setInterval(() => {{
-            const imgs = document.querySelectorAll("img[id^='snap-']");
-            imgs.forEach(img => {{
-                const base = img.src.split('?')[0];
-                img.src = base + "?t=" + Date.now();
-            }});
-        }}, 2000);
-        </script>
+        <div class=\"nav\">__NAV__</div>
+        __BODY__
     </body>
     </html>
     """
+
+    return (
+        template.replace("__NAV__", nav_html)
+        .replace("__BODY__", body)
+        .replace("__TITLE__", title)
+    )
+
+
+@app.get("/", response_class=HTMLResponse)
+def index_page():
+    host = CAMERA_CONFIG.get("host", DEFAULT_CAMERA_HOST)
+    cards = []
+    for cam in CAMERA_CONFIG.get("cameras", []):
+        cam_id = cam["id"]
+        port = cam.get("port")
+        name = cam.get("name", cam_id)
+        cards.append(
+            f"""
+            <div class='card'>
+                <div style='display:flex; justify-content: space-between; align-items:center;'>
+                    <div>
+                        <div class='pill'>🎥 Camera · {cam_id}</div>
+                        <h3 style='margin:8px 0 4px;'>{name}</h3>
+                        <p class='muted'>Device index: {cam['device']}</p>
+                    </div>
+                    <div style='text-align:right;'>
+                        <div class='muted'>Port</div>
+                        <div style='font-weight:700;'>:{port}</div>
+                    </div>
+                </div>
+                <div style='margin:12px 0;'>
+                    <img src='/cam/{cam_id}/video' style='width:100%; border:1px solid var(--border); border-radius:10px;'>
+                </div>
+                <div style='display:flex; gap:12px; align-items:center; flex-wrap:wrap;'>
+                    <img id='snap-{cam_id}' src='/cam/{cam_id}/snapshot' style='width:140px; border:1px solid var(--border); border-radius:8px;'>
+                    <div>
+                        <div class='muted'>Main API</div>
+                        <code>/cam/{cam_id}/video</code><br>
+                        <code>/cam/{cam_id}/snapshot</code>
+                        <div style='margin-top:6px;' class='muted'>Nginx mapped:</div>
+                        <code>http://{host}:{port}/</code><br>
+                        <code>http://{host}:{port}/snapshot</code>
+                    </div>
+                </div>
+            </div>
+            """
+        )
+
+    body = f"""
+        <p class='muted'>Streams are available via the main API and per-camera ports generated in nginx.cameras.conf.</p>
+        <div class='card-grid'>
+            {''.join(cards) if cards else '<div class="card"><p>No cameras configured yet. Add one in Settings.</p></div>'}
+        </div>
+        <script>
+            setInterval(() => {{
+                const imgs = document.querySelectorAll("img[id^='snap-']");
+                imgs.forEach(img => {{
+                    const base = img.src.split('?')[0];
+                    img.src = base + "?t=" + Date.now();
+                }});
+            }}, 2000);
+        </script>
+    """
+
+    return _base_page("Pi Camera Server", "home", body)
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page():
+    body = """
+        <div class='card'>
+            <div style='display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;'>
+                <div>
+                    <div class='pill'>⚙️ Setup</div>
+                    <h2 style='margin:8px 0 4px;'>Camera configuration</h2>
+                    <p class='muted'>Edit the host and cameras, then save to regenerate nginx.cameras.conf and restart capture threads.</p>
+                </div>
+                <button class='btn' onclick='saveConfig()'>💾 Save changes</button>
+            </div>
+            <div style='margin-top:16px;'>
+                <label class='muted'>Binding host</label>
+                <input class='input' id='host' placeholder='0.0.0.0'>
+            </div>
+            <div style='margin-top:16px; display:flex; justify-content:space-between; align-items:center;'>
+                <h3 style='margin:0;'>Cameras</h3>
+                <button class='btn-secondary btn' onclick='addRow()'>＋ Add camera</button>
+            </div>
+            <div style='overflow-x:auto;'>
+                <table id='cam-table'>
+                    <thead>
+                        <tr><th>ID</th><th>Name</th><th>Device</th><th>Port</th><th></th></tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <div id='status' class='status muted'></div>
+        </div>
+        <script>
+            const tbody = document.querySelector('#cam-table tbody');
+            function addRow(cam={id:'', name:'', device:'', port:''}) {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td><input class='input' value='${cam.id}' placeholder='cam1'></td>
+                    <td><input class='input' value='${cam.name}' placeholder='USB Cam'></td>
+                    <td><input class='input' value='${cam.device}' type='number' min='0' style='width:90px'></td>
+                    <td><input class='input' value='${cam.port ?? ''}' type='number' min='0' style='width:100px'></td>
+                    <td style='width:60px; text-align:right;'><button class='btn-secondary btn' onclick='this.closest("tr").remove()'>✖</button></td>
+                `;
+                tbody.appendChild(tr);
+            }
+
+            async function loadConfig() {
+                const res = await fetch('/api/cameras');
+                const data = await res.json();
+                document.querySelector('#host').value = data.host || '';
+                tbody.innerHTML = '';
+                (data.cameras || []).forEach(addRow);
+            }
+
+            async function saveConfig() {
+                const status = document.getElementById('status');
+                const rows = Array.from(tbody.querySelectorAll('tr'));
+                const cameras = rows.map(r => {
+                    const [id,name,device,port] = Array.from(r.querySelectorAll('input')).map(i => i.value.trim());
+                    return { id, name, device: Number(device), port: port ? Number(port) : null };
+                }).filter(c => c.id);
+                const payload = { host: document.getElementById('host').value || '0.0.0.0', cameras };
+                status.textContent = 'Saving…';
+                try {
+                    const res = await fetch('/api/cameras', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload),
+                    });
+                    if (!res.ok) throw new Error(await res.text());
+                    await res.json();
+                    status.textContent = 'Saved! Cameras restarted and nginx config regenerated.';
+                    status.classList.remove('muted');
+                    setTimeout(() => location.href='/', 800);
+                } catch (err) {
+                    status.textContent = 'Failed: ' + err;
+                    status.classList.remove('muted');
+                }
+            }
+
+            loadConfig();
+        </script>
+    """
+    return _base_page("Settings · Pi Camera Server", "settings", body)
+
+
+@app.get("/api-docs", response_class=HTMLResponse)
+def api_docs_page():
+    host = CAMERA_CONFIG.get("host", DEFAULT_CAMERA_HOST)
+    rows = []
+    for cam in CAMERA_CONFIG.get("cameras", []):
+        cam_id = cam["id"]
+        port = cam.get("port")
+        rows.append(
+            f"<tr><td>{cam_id}</td><td>/cam/{cam_id}/video</td><td>/cam/{cam_id}/snapshot</td><td>http://{host}:{port}/</td><td>http://{host}:{port}/snapshot</td></tr>"
+        )
+
+    body = f"""
+        <div class='card'>
+            <div class='pill'>📘 API</div>
+            <h2 style='margin:8px 0 4px;'>HTTP endpoints</h2>
+            <p class='muted'>Reference for integrating streams into dashboards or other services.</p>
+            <h3>Configuration</h3>
+            <ul>
+                <li><code>GET /api/cameras</code> — returns the current host and camera list.</li>
+                <li><code>POST /api/cameras</code> — update host and cameras; regenerates nginx.cameras.conf and restarts capture.</li>
+            </ul>
+            <h3>Streaming</h3>
+            <p class='muted'>Replace <code>{{cam_id}}</code> with a configured camera ID.</p>
+            <ul>
+                <li><code>/cam/{{cam_id}}/video</code> — MJPEG stream (multipart/x-mixed-replace).</li>
+                <li><code>/cam/{{cam_id}}/snapshot</code> — single JPEG frame.</li>
+            </ul>
+            <h3>Per-camera ports (Nginx proxy)</h3>
+            <p class='muted'>Enable by including <code>nginx.cameras.conf</code> in your nginx configuration.</p>
+            <table>
+                <thead><tr><th>Camera</th><th>Video (API)</th><th>Snapshot (API)</th><th>Video (port)</th><th>Snapshot (port)</th></tr></thead>
+                <tbody>{''.join(rows) if rows else '<tr><td colspan="5" class="muted">No cameras configured.</td></tr>'}</tbody>
+            </table>
+        </div>
+    """
+    return _base_page("API Docs · Pi Camera Server", "docs", body)
 
 
 @app.get("/api/cameras")

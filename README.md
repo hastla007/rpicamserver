@@ -9,6 +9,7 @@ central API handles configuration and a simple front-end viewer.
 - Background frame grabber per camera using OpenCV
 - MJPEG video and snapshot endpoints per camera via `http://<host>:<port>/` and `/snapshot` (Nginx proxy)
 - Central FastAPI app with configuration APIs and built-in viewer
+- Integrated web UI with camera dashboard, settings editor, and API reference
 - JSON-based configuration persisted to `cameras.json`
 - Hot reload of camera capture threads and regenerated Nginx mapping when configuration is updated via the API
 
@@ -47,7 +48,9 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 
 On startup the app loads `cameras.json`, spins up background frame grabbers, and
 generates `nginx.cameras.conf` that maps per-camera ports to the main API
-streams. Visit `http://<host>:8000/` for the built-in viewer.
+streams. Visit `http://<host>:8000/` for the built-in viewer. Use the
+navigation to jump between the live camera dashboard, the Settings page (to add
+or edit cameras), and the API Docs page for endpoint details.
 
 ### Apply Nginx mapping
 
