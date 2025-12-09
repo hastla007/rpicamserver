@@ -22,6 +22,7 @@ Typical uses include:
 - Optional per-camera capture settings (resolution, FPS, brightness, exposure, and white balance)
 - Snapshot responses fall back to an inline "offline" placeholder instead of errors
 - Optional HTTP basic auth for configuration endpoints (toggleable in the Settings UI or JSON config)
+- /health endpoint plus Prometheus-style /metrics gauges for availability, subscribers, and frame ages
 
 ## Getting started
 
@@ -67,6 +68,15 @@ generates `nginx.cameras.conf` that maps per-camera ports to the main API
 streams. Visit `http://<host>:8000/` for the built-in viewer. Use the
 navigation to jump between the live camera dashboard, the Settings page (to add
 or edit cameras), and the API Docs page for endpoint details.
+
+If your browser or environment blocks the built-in UI (e.g., locked-down
+Chromium policies), you can still manage the server headlessly:
+
+- Read config: `curl http://<host>:8000/api/cameras`
+- Discover devices: `curl 'http://<host>:8000/api/devices?probe_missing=false'`
+- Apply config: `curl -X POST http://<host>:8000/api/cameras -H 'Content-Type: application/json' -d @cameras.json`
+- Check status: `curl http://<host>:8000/health`
+- Scrape metrics: `curl http://<host>:8000/metrics`
 
 ### Apply Nginx mapping
 

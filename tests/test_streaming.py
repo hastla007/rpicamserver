@@ -33,7 +33,7 @@ def test_discover_respects_probe_limits(monkeypatch, device_registry):
 
 def test_snapshot_placeholder_when_no_frame(device_registry):
     device_registry[0] = {"frames": []}
-    cam = app.Camera(0)
+    cam = app.Camera("cam0", 0)
     app.CAMERAS = {"cam0": cam}
 
     try:
@@ -99,9 +99,51 @@ def test_placeholder_uses_config_resolution(monkeypatch):
     assert shapes[-1] == (360, 640)
 
 
+def test_placeholder_returned_for_missing_camera(monkeypatch):
+    app.CAMERA_CONFIG = {
+        "host": "0.0.0.0",
+        "auth": app.default_config()["auth"],
+        "cameras": [
+            {"id": "cam_missing", "name": "Missing", "device": 0, "width": 160, "height": 120},
+        ],
+    }
+    # CAMERAS intentionally empty
+    data = app.get_snapshot_bytes("cam_missing")
+    assert isinstance(data, (bytes, bytearray))
+    assert data
+
+
+def test_health_summarises_status(monkeypatch):
+    app.CAMERA_CONFIG = {
+        "host": "0.0.0.0",
+        "auth": app.default_config()["auth"],
+        "cameras": [
+            {"id": "camA", "name": "One", "device": 0},
+            {"id": "camB", "name": "Two", "device": 1},
+        ],
+    }
+    app.CAMERA_STATUS = {"camA": {"state": "online", "message": "running"}}
+    health = app.health()
+    assert health["summary"]["total"] == 2
+    assert health["summary"]["online"] == 1
+
+
+def test_metrics_plain_text(monkeypatch):
+    app.CAMERA_CONFIG = {
+        "host": "0.0.0.0",
+        "auth": app.default_config()["auth"],
+        "cameras": [
+            {"id": "camM", "name": "One", "device": 0},
+        ],
+    }
+    app.CAMERA_STATUS = {"camM": {"state": "offline", "message": "not started"}}
+    res = app.metrics()
+    assert "rpicam_camera_online" in res.body.decode()
+
+
 async def test_mjpeg_generator_tracks_subscribers(device_registry, sample_frame):
     device_registry[0] = {"frames": [sample_frame for _ in range(5)]}
-    cam = app.Camera(0)
+    cam = app.Camera("cam0", 0)
     app.CAMERAS = {"cam0": cam}
 
     try:

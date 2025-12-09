@@ -84,6 +84,7 @@ def isolate_app(monkeypatch, tmp_path):
 
     app.CAMERA_CONFIG = app.default_config()
     app.CAMERAS = {}
+    app.CAMERA_STATUS = {}
 
     yield tmp_config
 

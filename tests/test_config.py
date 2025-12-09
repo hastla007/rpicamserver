@@ -28,6 +28,20 @@ def test_validate_camera_entries_detects_conflicts():
     valid = [{"id": "cam1", "name": "One", "device": 0, "port": 8081}]
     app.validate_camera_entries(valid)
 
+    # Zero-valued controls should be accepted
+    app.validate_camera_entries(
+        [
+            {
+                "id": "camZero",
+                "name": "Zero",
+                "device": 0,
+                "brightness": 0,
+                "exposure": 0,
+                "white_balance": 0,
+            }
+        ]
+    )
+
     with pytest.raises(ValueError):
         app.validate_camera_entries(
             [

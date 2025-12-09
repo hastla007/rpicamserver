@@ -42,6 +42,7 @@ PROBE_WHEN_NO_DEVICES = os.getenv("PROBE_WHEN_NO_DEVICES", "false").lower() == "
 
 logger = logging.getLogger("rpicamserver")
 security = HTTPBasic(auto_error=False)
+CAMERA_STATUS: Dict[str, Dict[str, Any]] = {}
 
 
 class SafeSysLogHandler(SysLogHandler):
@@ -113,6 +114,7 @@ class Camera:
 
     def __init__(
         self,
+        cam_id: str,
         device_index: int,
         width: Optional[int] = None,
         height: Optional[int] = None,
@@ -121,6 +123,7 @@ class Camera:
         exposure: Optional[float] = None,
         white_balance: Optional[float] = None,
     ) -> None:
+        self.cam_id = cam_id
         self.device_index = device_index
         self.width = width
         self.height = height
@@ -193,8 +196,18 @@ class Camera:
             self.cap = self._open_capture()
             self.failure_count = 0
             self.idle_event.set()
+            CAMERA_STATUS[self.cam_id] = {
+                "state": "online",
+                "message": "running",
+                "device": self.device_index,
+            }
             logger.info("Restarted camera device %s", self.device_index)
         except Exception as exc:  # noqa: BLE001
+            CAMERA_STATUS[self.cam_id] = {
+                "state": "offline",
+                "message": str(exc),
+                "device": self.device_index,
+            }
             logger.error("Failed to restart camera %s: %s", self.device_index, exc)
 
     def _update_loop(self) -> None:
@@ -221,6 +234,13 @@ class Camera:
             with self.frame_lock:
                 self.latest_frame = frame
                 self.last_frame_ts = time.time()
+            CAMERA_STATUS[self.cam_id] = {
+                "state": "online",
+                "message": "running",
+                "device": self.device_index,
+                "last_frame_ts": self.last_frame_ts,
+                "subscribers": self._subscriber_count(),
+            }
 
             time.sleep(self.capture_interval)
 
@@ -314,6 +334,7 @@ def default_config() -> Dict[str, Any]:
 def validate_camera_entries(cameras: List[Dict[str, Any]]) -> None:
     """Validate required camera fields and uniqueness constraints."""
 
+    errors: List[str] = []
     seen_ids: set[str] = set()
     seen_ports: set[int] = set()
 
@@ -330,39 +351,44 @@ def validate_camera_entries(cameras: List[Dict[str, Any]]) -> None:
         white_balance = cam.get("white_balance")
 
         if not cam_id:
-            raise ValueError("Camera id is required.")
-        if cam_id in seen_ids:
-            raise ValueError(f"Duplicate camera id '{cam_id}' is not allowed.")
+            errors.append("Camera id is required.")
+        elif cam_id in seen_ids:
+            errors.append(f"Duplicate camera id '{cam_id}' is not allowed.")
         if not name:
-            raise ValueError(f"Camera '{cam_id}' must have a name.")
+            errors.append(f"Camera '{cam_id or 'unknown'}' must have a name.")
         if device is None or device < 0:
-            raise ValueError(f"Camera '{cam_id}' requires a non-negative device index.")
+            errors.append(f"Camera '{cam_id or 'unknown'}' requires a non-negative device index.")
         if width is not None and width <= 0:
-            raise ValueError(f"Camera '{cam_id}' width must be positive when provided.")
+            errors.append(f"Camera '{cam_id or 'unknown'}' width must be positive when provided.")
         if height is not None and height <= 0:
-            raise ValueError(f"Camera '{cam_id}' height must be positive when provided.")
+            errors.append(f"Camera '{cam_id or 'unknown'}' height must be positive when provided.")
         if fps is not None and fps <= 0:
-            raise ValueError(f"Camera '{cam_id}' fps must be positive when provided.")
+            errors.append(f"Camera '{cam_id or 'unknown'}' fps must be positive when provided.")
         for field_name, value in {
             "brightness": brightness,
             "exposure": exposure,
             "white_balance": white_balance,
         }.items():
-            if value is not None:
+            if value is not None and value != "":
                 try:
                     float(value)
                 except (TypeError, ValueError):
-                    raise ValueError(
-                        f"Camera '{cam_id}' {field_name} must be numeric when provided."
-                    ) from None
+                    errors.append(
+                        f"Camera '{cam_id or 'unknown'}' {field_name} must be numeric when provided."
+                    )
         if port is not None:
             if port <= 0:
-                raise ValueError(f"Camera '{cam_id}' has an invalid port: {port}.")
+                errors.append(f"Camera '{cam_id or 'unknown'}' has an invalid port: {port}.")
             if port in seen_ports:
-                raise ValueError(f"Duplicate port {port} is not allowed; leave blank to auto-assign.")
+                errors.append(
+                    f"Duplicate port {port} is not allowed; leave blank for auto-assignment."
+                )
             seen_ports.add(port)
 
         seen_ids.add(cam_id)
+
+    if errors:
+        raise ValueError("; ".join(errors))
 
 
 def validate_auth(auth_cfg: Dict[str, Any]) -> None:
@@ -636,6 +662,7 @@ def stop_cameras() -> None:
     for camera in CAMERAS.values():
         camera.stop()
     CAMERAS.clear()
+    CAMERA_STATUS.clear()
 
 
 def init_cameras() -> None:
@@ -653,6 +680,7 @@ def init_cameras() -> None:
 
         try:
             camera = Camera(
+                cam_id,
                 device_index,
                 width=width,
                 height=height,
@@ -663,9 +691,19 @@ def init_cameras() -> None:
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to start camera %s: %s", cam_id, exc)
+            CAMERA_STATUS[cam_id] = {
+                "state": "offline",
+                "message": str(exc),
+                "device": device_index,
+            }
             continue
 
         CAMERAS[cam_id] = camera
+        CAMERA_STATUS[cam_id] = {
+            "state": "online",
+            "message": "running",
+            "device": device_index,
+        }
         logger.info("Started camera %s on device %s", cam_id, device_index)
 
 
@@ -675,38 +713,55 @@ def init_cameras() -> None:
 
 
 async def mjpeg_generator(cam_id: str):
-    if cam_id not in CAMERAS:
+    config_exists = any(c.get("id") == cam_id for c in CAMERA_CONFIG.get("cameras", []))
+    camera = CAMERAS.get(cam_id)
+    boundary = "frame"
+
+    if camera is None and not config_exists:
         raise HTTPException(status_code=404, detail="Camera not found")
 
-    camera = CAMERAS[cam_id]
-    boundary = "frame"
-    camera.add_subscriber()
+    if camera:
+        camera.add_subscriber()
 
     try:
         while True:
-            frame = await asyncio.to_thread(camera.get_frame, True, 1.0)
-            if frame is None:
-                await asyncio.sleep(0.1)
-                continue
+            if camera:
+                frame = await asyncio.to_thread(camera.get_frame, True, 1.0)
+                if frame is None:
+                    await asyncio.sleep(0.1)
+                    continue
 
-            jpg_bytes = _encode_frame(frame, quality=80)
-            if jpg_bytes is None:
-                await asyncio.sleep(camera.capture_interval)
-                continue
+                jpg_bytes = _encode_frame(frame, quality=80)
+                if jpg_bytes is None:
+                    await asyncio.sleep(camera.capture_interval)
+                    continue
+                sleep_interval = camera.capture_interval
+            else:
+                width, height = _configured_resolution(cam_id)
+                jpg_bytes = _offline_placeholder(cam_id, width, height)
+                sleep_interval = 1.0
 
             yield (
                 b"--" + boundary.encode() + b"\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + jpg_bytes + b"\r\n"
             )
-            await asyncio.sleep(camera.capture_interval)
+            await asyncio.sleep(sleep_interval)
     finally:
-        camera.remove_subscriber()
+        if camera:
+            camera.remove_subscriber()
 
 
 def get_snapshot_bytes(cam_id: str) -> bytes:
-    if cam_id not in CAMERAS:
+    camera = CAMERAS.get(cam_id)
+    config_exists = any(c.get("id") == cam_id for c in CAMERA_CONFIG.get("cameras", []))
+
+    if not camera and not config_exists:
         raise HTTPException(status_code=404, detail="Camera not found")
-    camera = CAMERAS[cam_id]
+
+    if not camera:
+        target_width, target_height = _configured_resolution(cam_id)
+        return _offline_placeholder(cam_id, width=target_width, height=target_height)
+
     frame = camera.get_frame(wait=True, timeout=1.5)
     if frame is None:
         logger.warning("No frame available for %s; returning placeholder.", cam_id)
@@ -721,6 +776,42 @@ def get_snapshot_bytes(cam_id: str) -> bytes:
             return placeholder
         raise HTTPException(status_code=500, detail="Failed to encode frame")
     return jpg_bytes
+
+
+def camera_statuses() -> List[Dict[str, Any]]:
+    now = time.time()
+    configs = {cam.get("id"): cam for cam in CAMERA_CONFIG.get("cameras", [])}
+    statuses: List[Dict[str, Any]] = []
+
+    for cam_id, cfg in configs.items():
+        status = {
+            "id": cam_id,
+            "state": "offline",
+            "message": "not started",
+            "device": cfg.get("device"),
+            "port": cfg.get("port"),
+            "last_frame_age": None,
+            "last_frame_ts": None,
+            "subscribers": 0,
+        }
+
+        if cam_id in CAMERA_STATUS:
+            status.update(CAMERA_STATUS[cam_id])
+
+        camera = CAMERAS.get(cam_id)
+        if camera:
+            status["subscribers"] = camera._subscriber_count()
+            if camera.last_frame_ts:
+                age = now - camera.last_frame_ts
+                status["last_frame_age"] = age
+                status["last_frame_ts"] = camera.last_frame_ts
+                if age > 5 and status.get("state") == "online":
+                    status["state"] = "stale"
+                    status["message"] = "no recent frames"
+
+        statuses.append(status)
+
+    return statuses
 
 
 ###############################################################################
@@ -850,6 +941,8 @@ def _base_page(title: str, active: str, body: str) -> str:
             .status.error { color: #fca5a5; }
             .status.success { color: #a7f3d0; }
             a { color: #93c5fd; }
+            .pill.offline { background: rgba(248,113,113,0.1); color: #fecaca; border-color: rgba(248,113,113,0.35); }
+            .pill.stale { background: rgba(251,191,36,0.1); color: #fcd34d; border-color: rgba(251,191,36,0.35); }
         </style>
     </head>
     <body>
@@ -894,6 +987,7 @@ def index_page():
                         <h3 style='margin:8px 0 4px;'>{name}</h3>
                         <p class='muted'>Device index: {cam['device']}</p>
                         <p class='muted'>Capture: {res_text}</p>
+                        <div class='pill status-pill muted' data-cam='{cam_id}' aria-live='polite'>Status: checking…</div>
                     </div>
                     <div style='text-align:right;'>
                         <div class='muted'>Port</div>
@@ -931,6 +1025,26 @@ def index_page():
                     img.src = base + "?t=" + Date.now();
                 }});
             }}, 2000);
+
+            async function refreshHealth() {{
+                try {{
+                    const res = await fetch('/health');
+                    const data = await res.json();
+                    (data.cameras || []).forEach(cam => {{
+                        const pill = document.querySelector(`.status-pill[data-cam="${{cam.id}}"]`);
+                        if (!pill) return;
+                        pill.classList.remove('offline', 'stale', 'muted');
+                        if (cam.state === 'offline') pill.classList.add('offline');
+                        else if (cam.state === 'stale') pill.classList.add('stale');
+                        pill.textContent = `Status: ${{cam.state}}${{cam.message ? ' · ' + cam.message : ''}}`;
+                    }});
+                }} catch (err) {{
+                    console.warn('Health check failed', err);
+                }}
+            }}
+
+            refreshHealth();
+            setInterval(refreshHealth, 5000);
         </script>
     """
 
@@ -1247,6 +1361,8 @@ def api_docs_page():
                 <li><code>GET /api/cameras</code> — returns the current host and camera list.</li>
                 <li><code>POST /api/cameras</code> — update host and cameras; regenerates nginx.cameras.conf and restarts capture.</li>
                 <li><code>GET /api/devices</code> — list detected video devices and whether they are already assigned.</li>
+                <li><code>GET /health</code> — summary of camera states (online, stale, offline) and last frame ages.</li>
+                <li><code>GET /metrics</code> — Prometheus-style gauges for availability, subscribers, and frame ages.</li>
             </ul>
             <p class='muted'>Optional basic auth (configured in Settings) secures these endpoints and the Settings/API Docs pages; streams remain open by default.</p>
             <p class='muted'>Camera fields: <code>id</code>, <code>name</code>, <code>device</code>, optional <code>port</code>, <code>width</code>, <code>height</code>, <code>fps</code>, and optional controls <code>brightness</code>, <code>exposure</code>, <code>white_balance</code>.</p>
@@ -1254,7 +1370,7 @@ def api_docs_page():
             <p class='muted'>Replace <code>{{cam_id}}</code> with a configured camera ID.</p>
             <ul>
                 <li><code>/cam/{{cam_id}}/video</code> — MJPEG stream (multipart/x-mixed-replace).</li>
-                <li><code>/cam/{{cam_id}}/snapshot</code> — single JPEG frame.</li>
+                <li><code>/cam/{{cam_id}}/snapshot</code> — single JPEG frame (returns an offline placeholder if the camera is unavailable).</li>
             </ul>
             <p class='muted'>Device discovery: <code>/api/devices?max=4&probe_missing=true</code> to scan a specific range when no <code>/dev/video*</code> entries are present.</p>
             <h3>Per-camera ports (Nginx proxy)</h3>
@@ -1301,6 +1417,54 @@ def set_cameras(data: CamerasUpdate):
     init_cameras()
     generate_nginx_config(CAMERA_CONFIG)
     return {"status": "ok", "cameras": CAMERA_CONFIG}
+
+
+@app.get("/health")
+def health():
+    statuses = camera_statuses()
+    summary = {
+        "total": len(statuses),
+        "online": sum(1 for s in statuses if s.get("state") == "online"),
+        "stale": sum(1 for s in statuses if s.get("state") == "stale"),
+        "offline": sum(1 for s in statuses if s.get("state") == "offline"),
+    }
+    return {"status": "ok", "summary": summary, "cameras": statuses}
+
+
+@app.get("/metrics")
+def metrics():
+    statuses = camera_statuses()
+    lines = [
+        "# HELP rpicam_camera_online Camera availability (1=online, 0=offline/stale)",
+        "# TYPE rpicam_camera_online gauge",
+    ]
+    for st in statuses:
+        val = 1 if st.get("state") == "online" else 0
+        lines.append(f'rpicam_camera_online{{camera="{st.get("id")}"}} {val}')
+
+    lines.extend(
+        [
+            "# HELP rpicam_camera_subscribers Active stream subscribers",
+            "# TYPE rpicam_camera_subscribers gauge",
+        ]
+    )
+    for st in statuses:
+        subs = st.get("subscribers") or 0
+        lines.append(f'rpicam_camera_subscribers{{camera="{st.get("id")}"}} {subs}')
+
+    lines.extend(
+        [
+            "# HELP rpicam_camera_frame_age_seconds Age of last frame in seconds",
+            "# TYPE rpicam_camera_frame_age_seconds gauge",
+        ]
+    )
+    for st in statuses:
+        age = st.get("last_frame_age")
+        if age is None:
+            continue
+        lines.append(f'rpicam_camera_frame_age_seconds{{camera="{st.get("id")}"}} {age:.3f}')
+
+    return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
 
 @app.get("/cam/{cam_id}/video")
