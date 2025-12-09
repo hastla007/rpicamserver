@@ -91,6 +91,36 @@ def default_config() -> Dict[str, Any]:
     return {"host": DEFAULT_CAMERA_HOST, "cameras": []}
 
 
+def validate_camera_entries(cameras: List[Dict[str, Any]]) -> None:
+    """Validate required camera fields and uniqueness constraints."""
+
+    seen_ids: set[str] = set()
+    seen_ports: set[int] = set()
+
+    for cam in cameras:
+        cam_id = str(cam.get("id", "")).strip()
+        name = str(cam.get("name", "")).strip()
+        device = cam.get("device")
+        port = cam.get("port")
+
+        if not cam_id:
+            raise ValueError("Camera id is required.")
+        if cam_id in seen_ids:
+            raise ValueError(f"Duplicate camera id '{cam_id}' is not allowed.")
+        if not name:
+            raise ValueError(f"Camera '{cam_id}' must have a name.")
+        if device is None or device < 0:
+            raise ValueError(f"Camera '{cam_id}' requires a non-negative device index.")
+        if port is not None:
+            if port <= 0:
+                raise ValueError(f"Camera '{cam_id}' has an invalid port: {port}.")
+            if port in seen_ports:
+                raise ValueError(f"Duplicate port {port} is not allowed; leave blank to auto-assign.")
+            seen_ports.add(port)
+
+        seen_ids.add(cam_id)
+
+
 def load_config() -> Dict[str, Any]:
     if CONFIG_PATH.exists():
         config = json.loads(CONFIG_PATH.read_text())
@@ -98,6 +128,13 @@ def load_config() -> Dict[str, Any]:
         config = default_config()
 
     assigned_cameras = assign_ports(config.get("cameras", []))
+    try:
+        validate_camera_entries(assigned_cameras)
+    except ValueError as exc:  # noqa: BLE001
+        print(f"Invalid camera configuration: {exc}. Resetting to defaults.")
+        config = default_config()
+        assigned_cameras = []
+
     if assigned_cameras != config.get("cameras", []):
         config["cameras"] = assigned_cameras
         save_config(config)
@@ -111,22 +148,33 @@ def save_config(config: Dict[str, Any]) -> None:
 
 
 def assign_ports(cameras: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Ensure each camera has a unique port, auto-assigning if omitted."""
+    """Ensure each camera has a unique port, auto-assigning if omitted or duplicated."""
 
     assigned: List[Dict[str, Any]] = []
-    used_ports = {cam.get("port") for cam in cameras if cam.get("port")}
+    used_ports: set[int] = set()
     next_port = DEFAULT_START_PORT
 
     for cam in cameras:
         cam_copy = dict(cam)
         port = cam_copy.get("port")
+
+        if port is not None:
+            # Keep user-provided ports when available and unused.
+            if port in used_ports:
+                next_port = max(next_port, port + 1)
+                port = None
+            else:
+                used_ports.add(port)
+                next_port = max(next_port, port + 1)
+
         if port is None:
             while next_port in used_ports:
                 next_port += 1
             port = next_port
+            used_ports.add(port)
             next_port += 1
+
         cam_copy["port"] = port
-        used_ports.add(port)
         assigned.append(cam_copy)
 
     return assigned
@@ -377,6 +425,8 @@ def _base_page(title: str, active: str, body: str) -> str:
             th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); }
             .muted { color: var(--muted); font-size: 14px; }
             .status { margin-top: 12px; font-weight: 600; }
+            .status.error { color: #fca5a5; }
+            .status.success { color: #a7f3d0; }
             a { color: #93c5fd; }
         </style>
     </head>
@@ -486,6 +536,14 @@ def settings_page():
         </div>
         <script>
             const tbody = document.querySelector('#cam-table tbody');
+            const status = document.getElementById('status');
+
+            function setStatus(text, variant='muted') {
+                status.textContent = text;
+                status.classList.remove('error', 'success', 'muted');
+                status.classList.add(variant);
+            }
+
             function addRow(cam={id:'', name:'', device:'', port:''}) {
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
@@ -499,36 +557,62 @@ def settings_page():
             }
 
             async function loadConfig() {
-                const res = await fetch('/api/cameras');
-                const data = await res.json();
-                document.querySelector('#host').value = data.host || '';
-                tbody.innerHTML = '';
-                (data.cameras || []).forEach(addRow);
+                try {
+                    const res = await fetch('/api/cameras');
+                    const data = await res.json();
+                    document.querySelector('#host').value = data.host || '';
+                    tbody.innerHTML = '';
+                    (data.cameras || []).forEach(addRow);
+                    setStatus('Loaded configuration.');
+                } catch (err) {
+                    setStatus('Failed to load configuration: ' + err, 'error');
+                }
             }
 
             async function saveConfig() {
-                const status = document.getElementById('status');
                 const rows = Array.from(tbody.querySelectorAll('tr'));
+                const errors = [];
+                const seenIds = new Set();
+                const seenPorts = new Set();
+
                 const cameras = rows.map(r => {
                     const [id,name,device,port] = Array.from(r.querySelectorAll('input')).map(i => i.value.trim());
-                    return { id, name, device: Number(device), port: port ? Number(port) : null };
+                    const deviceNum = device === '' ? NaN : Number(device);
+                    const portNum = port === '' ? null : Number(port);
+
+                    if (!id) errors.push('Camera ID is required.');
+                    if (id && seenIds.has(id)) errors.push(`Duplicate camera id "${id}".`);
+                    seenIds.add(id);
+                    if (!name) errors.push(`Camera "${id || '(new)'}" must have a name.`);
+                    if (!Number.isFinite(deviceNum) || deviceNum < 0) errors.push(`Camera "${id || '(new)'}" needs a non-negative device index.`);
+                    if (portNum !== null) {
+                        if (!Number.isFinite(portNum) || portNum <= 0) errors.push(`Camera "${id || '(new)'}" has an invalid port.`);
+                        if (seenPorts.has(portNum)) errors.push(`Port ${portNum} is duplicated.`);
+                        seenPorts.add(portNum);
+                    }
+
+                    return { id, name, device: deviceNum, port: portNum };
                 }).filter(c => c.id);
+
+                if (errors.length) {
+                    setStatus(errors.join(' '), 'error');
+                    return;
+                }
+
                 const payload = { host: document.getElementById('host').value || '0.0.0.0', cameras };
-                status.textContent = 'Saving…';
+                setStatus('Saving…');
                 try {
                     const res = await fetch('/api/cameras', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(payload),
                     });
-                    if (!res.ok) throw new Error(await res.text());
+                    if (!res.ok) throw new Error((await res.json()).detail || await res.text());
                     await res.json();
-                    status.textContent = 'Saved! Cameras restarted and nginx config regenerated.';
-                    status.classList.remove('muted');
+                    setStatus('Saved! Cameras restarted and nginx config regenerated.', 'success');
                     setTimeout(() => location.href='/', 800);
                 } catch (err) {
-                    status.textContent = 'Failed: ' + err;
-                    status.classList.remove('muted');
+                    setStatus('Failed: ' + err, 'error');
                 }
             }
 
@@ -585,6 +669,11 @@ def get_cameras():
 def set_cameras(data: CamerasUpdate):
     global CAMERA_CONFIG
     camera_dicts = [cam.dict() for cam in data.cameras]
+    try:
+        validate_camera_entries(camera_dicts)
+    except ValueError as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     CAMERA_CONFIG = {"host": data.host, "cameras": assign_ports(camera_dicts)}
     save_config(CAMERA_CONFIG)
     init_cameras()
