@@ -25,7 +25,18 @@ Typical uses include:
 - Manual restart button per camera on the dashboard plus a `POST /api/cameras/{id}/restart` endpoint for recovery
 - /health endpoint plus Prometheus-style /metrics gauges for availability, subscribers, and frame ages
 
-## Getting started
+
+## Automatic Installation
+
+This one‑liner downloads the script and executes it.
+
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/hastla007/rpicamserver/main/install.sh)"
+
+
+
+
+
+## Getting started - Manual Installation
 
 ### Install dependencies
 Install system prerequisites for OpenCV (varies by distro) and the Python
