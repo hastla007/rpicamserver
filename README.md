@@ -30,8 +30,9 @@ Typical uses include:
 
 This one‑liner downloads the script and executes it.
 
+```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/hastla007/rpicamserver/main/install.sh)"
-
+```
 
 
 
