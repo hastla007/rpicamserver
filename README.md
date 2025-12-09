@@ -19,7 +19,8 @@ Typical uses include:
 - JSON-based configuration persisted to `cameras.json`
 - Hot reload of camera capture threads and regenerated Nginx mapping when configuration is updated via the API
 - Camera discovery endpoint to list connected devices and avoid assigning the same camera twice
-- Optional per-camera capture settings (resolution and FPS)
+- Optional per-camera capture settings (resolution, FPS, brightness, exposure, and white balance)
+- Snapshot responses fall back to an inline "offline" placeholder instead of errors
 
 ## Getting started
 
@@ -45,7 +46,8 @@ Update each camera entry to point to the correct device index and (optionally)
 choose a port for the Nginx-mapped endpoints. Device indices map to `/dev/video*`
 devices on most Linux systems. Ports are auto-assigned starting at 8081 if
 omitted. You can also set `width`, `height`, and `fps` to request a specific
-capture resolution and frame rate for each camera.
+capture resolution and frame rate for each camera, plus optional `brightness`,
+`exposure`, and `white_balance` controls when supported by the device driver.
 
 ### Run the server
 Start the main FastAPI control plane (defaults to port 8000; override with
@@ -96,7 +98,7 @@ curl -X POST http://<host>:8000/api/cameras \
   -d '{
     "host": "0.0.0.0",
     "cameras": [
-      {"id": "cam1", "name": "USB Cam 1", "device": 0, "port": 8081, "width": 1280, "height": 720, "fps": 30},
+      {"id": "cam1", "name": "USB Cam 1", "device": 0, "port": 8081, "width": 1280, "height": 720, "fps": 30, "brightness": 0.5, "exposure": -4, "white_balance": 4500},
       {"id": "cam2", "name": "USB Cam 2", "device": 1, "port": 8082}
     ]
   }'
@@ -115,9 +117,16 @@ You can discover attached cameras (and which ones are already assigned) with
 - `GET /api-docs` – HTML API reference shown in the UI
 - `GET /api/cameras` – Return current configuration JSON
 - `POST /api/cameras` – Persist configuration, restart captures, regenerate Nginx map
-- `GET /api/devices` – Enumerate detected video devices and flag ones already configured
+- `GET /api/devices` – Enumerate detected video devices and flag ones already configured. Query params: `max` to cap the probe range (defaults to `MAX_DEVICE_PROBE`, 4), and `probe_missing=true` to force probing when no `/dev/video*` nodes are present (defaults to off).
 - `GET /cam/{id}/video` – MJPEG video stream for camera `{id}`
 - `GET /cam/{id}/snapshot` – Single JPEG frame for camera `{id}`
+
+### Logging and discovery controls
+
+- `LOG_DEST` (comma-separated) chooses logging sinks: `stdout`, `file`, `syslog`. Defaults to `stdout`. Provide `LOG_FILE` when including `file`.
+- `LOG_LEVEL` controls verbosity (defaults to `INFO`).
+- `MAX_DEVICE_PROBE` caps how many numeric device indices are probed when no `/dev/video*` entries are present (default `4`).
+- `PROBE_WHEN_NO_DEVICES` (true/false) toggles probing numeric indices when globbing finds nothing (default `false` to avoid CPU churn in containerized environments).
 
 ## Testing and CI
 
@@ -169,5 +178,7 @@ case it addresses.
 - Streaming endpoints are async-based so multiple clients can connect without
   blocking, and capture threads pause when no subscribers are connected to save
   CPU.
-- Logging is emitted to stdout/stderr and `/dev/log` (syslog) when available.
+- Snapshots return an inline placeholder JPEG when a camera is offline instead
+  of a 503 error, which keeps dashboards from breaking while devices reconnect.
+- Logging destinations are configurable via `LOG_DEST`; syslog is only enabled when requested and `/dev/log` is reachable.
 - You can also run `python app.py` to start uvicorn with default settings.

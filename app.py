@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import cv2
+import numpy as np
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
@@ -31,32 +32,67 @@ NGINX_CONFIG_PATH = Path("nginx.cameras.conf")
 DEFAULT_CAMERA_HOST = "0.0.0.0"
 DEFAULT_START_PORT = 8081
 APP_PORT = int(os.getenv("APP_PORT", "8000"))
+LOG_DEST = os.getenv("LOG_DEST", "stdout").split(",")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_FILE = os.getenv("LOG_FILE")
+MAX_DEVICE_PROBE = int(os.getenv("MAX_DEVICE_PROBE", "4"))
+PROBE_WHEN_NO_DEVICES = os.getenv("PROBE_WHEN_NO_DEVICES", "false").lower() == "true"
 
 logger = logging.getLogger("rpicamserver")
+
+
+class SafeSysLogHandler(SysLogHandler):
+    """Syslog handler that disables itself on emit failures."""
+
+    def emit(self, record):  # type: ignore[override]
+        if self.disabled:
+            return
+
+        try:
+            super().emit(record)
+        except OSError as exc:
+            self.disabled = True
+            self.handleError(record)
+            fallback_logger = logging.getLogger("rpicamserver")
+            for handler in list(fallback_logger.handlers):
+                if handler is self:
+                    fallback_logger.removeHandler(self)
+            fallback_logger.warning("Disabling syslog handler after emit failure: %s", exc)
 
 
 def setup_logging() -> None:
     if logger.handlers:
         return
 
-    logger.setLevel(logging.INFO)
+    logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
     formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
+    destinations = {dest.strip().lower() for dest in LOG_DEST if dest.strip()}
+    if not destinations:
+        destinations = {"stdout"}
 
-    try:
-        syslog_handler = SysLogHandler(address="/dev/log")
-    except OSError:
-        syslog_handler = None
+    if "stdout" in destinations:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
 
-    if syslog_handler:
-        syslog_handler.setFormatter(formatter)
-        logger.addHandler(syslog_handler)
+    if "file" in destinations and LOG_FILE:
+        file_handler = logging.FileHandler(LOG_FILE)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    if "syslog" in destinations:
+        try:
+            syslog_handler = SafeSysLogHandler(address="/dev/log")
+        except OSError:
+            syslog_handler = None
+
+        if syslog_handler:
+            syslog_handler.setFormatter(formatter)
+            logger.addHandler(syslog_handler)
 
 
 setup_logging()
@@ -78,14 +114,21 @@ class Camera:
         width: Optional[int] = None,
         height: Optional[int] = None,
         fps: Optional[float] = None,
+        brightness: Optional[float] = None,
+        exposure: Optional[float] = None,
+        white_balance: Optional[float] = None,
     ) -> None:
         self.device_index = device_index
         self.width = width
         self.height = height
         self.fps = fps
+        self.brightness = brightness
+        self.exposure = exposure
+        self.white_balance = white_balance
         self.capture_interval = 1 / float(fps or 30.0)
         self.idle_wait = 5.0
         self.active_subscribers = 0
+        self.subscriber_lock = threading.Lock()
         self.idle_event = threading.Event()
         self.last_frame_ts = 0.0
         self.failure_count = 0
@@ -111,16 +154,29 @@ class Camera:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.height))
         if self.fps:
             cap.set(cv2.CAP_PROP_FPS, float(self.fps))
+        if self.brightness is not None and hasattr(cv2, "CAP_PROP_BRIGHTNESS"):
+            cap.set(getattr(cv2, "CAP_PROP_BRIGHTNESS"), float(self.brightness))
+        if self.exposure is not None and hasattr(cv2, "CAP_PROP_EXPOSURE"):
+            cap.set(getattr(cv2, "CAP_PROP_EXPOSURE"), float(self.exposure))
+        if self.white_balance is not None and hasattr(cv2, "CAP_PROP_WB_TEMPERATURE"):
+            cap.set(getattr(cv2, "CAP_PROP_WB_TEMPERATURE"), float(self.white_balance))
         return cap
 
     def add_subscriber(self) -> None:
-        self.active_subscribers += 1
+        with self.subscriber_lock:
+            self.active_subscribers += 1
         self.idle_event.set()
 
     def remove_subscriber(self) -> None:
-        self.active_subscribers = max(0, self.active_subscribers - 1)
-        if self.active_subscribers == 0:
+        with self.subscriber_lock:
+            self.active_subscribers = max(0, self.active_subscribers - 1)
+            zero = self.active_subscribers == 0
+        if zero:
             self.idle_event.set()
+
+    def _subscriber_count(self) -> int:
+        with self.subscriber_lock:
+            return self.active_subscribers
 
     def _restart_capture(self) -> None:
         try:
@@ -145,7 +201,7 @@ class Camera:
                 time.sleep(0.5)
                 continue
 
-            if self.active_subscribers <= 0:
+            if self._subscriber_count() <= 0:
                 self.idle_event.clear()
                 self.idle_event.wait(timeout=self.idle_wait)
                 # continue to read once to keep snapshots fresh when prompted
@@ -195,6 +251,25 @@ def _encode_frame(frame, quality: int = 80) -> Optional[bytes]:
     return jpeg.tobytes()
 
 
+def _offline_placeholder(cam_id: str) -> bytes:
+    """Return a small JPEG indicating the camera is offline."""
+
+    canvas = np.zeros((240, 320, 3), dtype=np.uint8)
+    canvas[:] = (28, 35, 52)
+    cv2.putText(
+        canvas,
+        f"{cam_id} offline",
+        (20, 120),
+        getattr(cv2, "FONT_HERSHEY_SIMPLEX", 0),
+        0.7,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA if hasattr(cv2, "LINE_AA") else 16,
+    )
+    placeholder = _encode_frame(canvas, quality=85)
+    return placeholder or b""
+
+
 ###############################################################################
 # Configuration
 ###############################################################################
@@ -218,6 +293,9 @@ def validate_camera_entries(cameras: List[Dict[str, Any]]) -> None:
         width = cam.get("width")
         height = cam.get("height")
         fps = cam.get("fps")
+        brightness = cam.get("brightness")
+        exposure = cam.get("exposure")
+        white_balance = cam.get("white_balance")
 
         if not cam_id:
             raise ValueError("Camera id is required.")
@@ -233,6 +311,18 @@ def validate_camera_entries(cameras: List[Dict[str, Any]]) -> None:
             raise ValueError(f"Camera '{cam_id}' height must be positive when provided.")
         if fps is not None and fps <= 0:
             raise ValueError(f"Camera '{cam_id}' fps must be positive when provided.")
+        for field_name, value in {
+            "brightness": brightness,
+            "exposure": exposure,
+            "white_balance": white_balance,
+        }.items():
+            if value is not None:
+                try:
+                    float(value)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"Camera '{cam_id}' {field_name} must be numeric when provided."
+                    ) from None
         if port is not None:
             if port <= 0:
                 raise ValueError(f"Camera '{cam_id}' has an invalid port: {port}.")
@@ -302,13 +392,33 @@ def assign_ports(cameras: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return assigned
 
 
-def discover_cameras(max_devices: int = 10) -> List[Dict[str, Any]]:
+def discover_cameras(
+    max_devices: Optional[int] = None, probe_when_empty: Optional[bool] = None
+) -> List[Dict[str, Any]]:
     """Probe video capture devices and return detected indices and metadata."""
 
     discovered: List[Dict[str, Any]] = []
     used_devices = {cam.get("device") for cam in CAMERA_CONFIG.get("cameras", [])}
-    existing_nodes = sorted({int(Path(dev).name.replace("video", "")) for dev in glob.glob("/dev/video*") if Path(dev).name.replace("video", "").isdigit()})
-    probe_indices = existing_nodes or list(range(max_devices))
+    existing_nodes = sorted(
+        {
+            int(Path(dev).name.replace("video", ""))
+            for dev in glob.glob("/dev/video*")
+            if Path(dev).name.replace("video", "").isdigit()
+        }
+    )
+    probe_limit = max_devices if max_devices is not None else MAX_DEVICE_PROBE
+    should_probe_missing = (
+        probe_when_empty
+        if probe_when_empty is not None
+        else PROBE_WHEN_NO_DEVICES
+    )
+
+    if existing_nodes:
+        probe_indices = existing_nodes
+    elif should_probe_missing and probe_limit > 0:
+        probe_indices = list(range(probe_limit))
+    else:
+        return []
 
     for idx in probe_indices:
         cap = cv2.VideoCapture(idx)
@@ -319,6 +429,21 @@ def discover_cameras(max_devices: int = 10) -> List[Dict[str, Any]]:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        brightness = (
+            float(cap.get(cv2.CAP_PROP_BRIGHTNESS))
+            if hasattr(cv2, "CAP_PROP_BRIGHTNESS")
+            else None
+        )
+        exposure = (
+            float(cap.get(cv2.CAP_PROP_EXPOSURE))
+            if hasattr(cv2, "CAP_PROP_EXPOSURE")
+            else None
+        )
+        white_balance = (
+            float(cap.get(cv2.CAP_PROP_WB_TEMPERATURE))
+            if hasattr(cv2, "CAP_PROP_WB_TEMPERATURE")
+            else None
+        )
         cap.release()
 
         discovered.append(
@@ -330,6 +455,11 @@ def discover_cameras(max_devices: int = 10) -> List[Dict[str, Any]]:
                     "height": height or None,
                 },
                 "fps": fps or None,
+                "controls": {
+                    "brightness": brightness if brightness else None,
+                    "exposure": exposure if exposure else None,
+                    "white_balance": white_balance if white_balance else None,
+                },
             }
         )
 
@@ -383,6 +513,11 @@ class CameraConfig(BaseModel):
     width: Optional[int] = Field(default=None, description="Capture width")
     height: Optional[int] = Field(default=None, description="Capture height")
     fps: Optional[float] = Field(default=None, description="Requested FPS")
+    brightness: Optional[float] = Field(default=None, description="Brightness level")
+    exposure: Optional[float] = Field(default=None, description="Exposure level")
+    white_balance: Optional[float] = Field(
+        default=None, description="White balance temperature"
+    )
 
 
 class CamerasUpdate(BaseModel):
@@ -414,9 +549,20 @@ def init_cameras() -> None:
         width = cam_cfg.get("width")
         height = cam_cfg.get("height")
         fps = cam_cfg.get("fps")
+        brightness = cam_cfg.get("brightness")
+        exposure = cam_cfg.get("exposure")
+        white_balance = cam_cfg.get("white_balance")
 
         try:
-            camera = Camera(device_index, width=width, height=height, fps=fps)
+            camera = Camera(
+                device_index,
+                width=width,
+                height=height,
+                fps=fps,
+                brightness=brightness,
+                exposure=exposure,
+                white_balance=white_balance,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to start camera %s: %s", cam_id, exc)
             continue
@@ -464,10 +610,14 @@ def get_snapshot_bytes(cam_id: str) -> bytes:
         raise HTTPException(status_code=404, detail="Camera not found")
     frame = CAMERAS[cam_id].get_frame(wait=True, timeout=1.5)
     if frame is None:
-        raise HTTPException(status_code=503, detail="No frame available yet")
+        logger.warning("No frame available for %s; returning placeholder.", cam_id)
+        return _offline_placeholder(cam_id)
 
     jpg_bytes = _encode_frame(frame, quality=90)
     if jpg_bytes is None:
+        placeholder = _offline_placeholder(cam_id)
+        if placeholder:
+            return placeholder
         raise HTTPException(status_code=500, detail="Failed to encode frame")
     return jpg_bytes
 
@@ -716,7 +866,7 @@ def settings_page():
             <div style='overflow-x:auto;'>
                 <table id='cam-table'>
                     <thead>
-                        <tr><th>ID</th><th>Name</th><th>Device</th><th>Port</th><th>Width</th><th>Height</th><th>FPS</th><th></th></tr>
+                        <tr><th>ID</th><th>Name</th><th>Device</th><th>Port</th><th>Width</th><th>Height</th><th>FPS</th><th>Brightness</th><th>Exposure</th><th>WB Temp</th><th></th></tr>
                     </thead>
                     <tbody></tbody>
                 </table>
@@ -765,7 +915,7 @@ def settings_page():
                 });
             }
 
-            function addRow(cam={id:'', name:'', device:'', port:'', width:'', height:'', fps:''}) {
+            function addRow(cam={id:'', name:'', device:'', port:'', width:'', height:'', fps:'', brightness:'', exposure:'', white_balance:''}) {
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
                     <td><input class='input' value='${cam.id}' placeholder='cam1'></td>
@@ -775,6 +925,9 @@ def settings_page():
                     <td><input class='input' value='${cam.width ?? ''}' type='number' min='0' style='width:100px' placeholder='auto'></td>
                     <td><input class='input' value='${cam.height ?? ''}' type='number' min='0' style='width:100px' placeholder='auto'></td>
                     <td><input class='input' value='${cam.fps ?? ''}' type='number' min='0' step='0.1' style='width:100px' placeholder='auto'></td>
+                    <td><input class='input' value='${cam.brightness ?? ''}' type='number' step='0.1' style='width:120px' placeholder='auto'></td>
+                    <td><input class='input' value='${cam.exposure ?? ''}' type='number' step='0.1' style='width:120px' placeholder='auto'></td>
+                    <td><input class='input' value='${cam.white_balance ?? ''}' type='number' step='1' style='width:120px' placeholder='auto'></td>
                     <td style='width:60px; text-align:right;'><button class='btn-secondary btn' onclick='this.closest("tr").remove(); updateDeviceSelects();'>✖</button></td>
                 `;
                 tbody.appendChild(tr);
@@ -821,14 +974,19 @@ def settings_page():
                         ? `${dev.resolution.width}×${dev.resolution.height}`
                         : 'unknown';
                     const fps = dev.fps ? `${dev.fps.toFixed(1)} fps` : 'unknown';
+                    const ctrl = dev.controls || {};
+                    const controls = ['brightness', 'exposure', 'white_balance']
+                        .map(key => ctrl[key] !== null && ctrl[key] !== undefined ? `${key}: ${ctrl[key].toFixed ? ctrl[key].toFixed(1) : ctrl[key]}` : null)
+                        .filter(Boolean)
+                        .join(' · ');
                     const dim = dev.in_use ? 'style="opacity:0.45;"' : '';
                     const action = dev.in_use
                         ? '<span class="pill" style="background:rgba(148,163,184,0.15); color:#cbd5e1; border-color:rgba(148,163,184,0.35);">In use</span>'
                         : `<button class='btn-secondary btn' onclick='addFromDevice(${dev.index})'>Add</button>`;
-                    return `<tr ${dim}><td>${dev.index}</td><td>${res}</td><td>${fps}</td><td>${action}</td></tr>`;
+                    return `<tr ${dim}><td>${dev.index}</td><td>${res}</td><td>${fps}</td><td>${controls || 'n/a'}</td><td>${action}</td></tr>`;
                 }).join('');
 
-                container.innerHTML = `<table><thead><tr><th>Device</th><th>Resolution</th><th>FPS</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+                container.innerHTML = `<table><thead><tr><th>Device</th><th>Resolution</th><th>FPS</th><th>Controls</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
             }
 
             function addFromDevice(index) {
@@ -837,7 +995,8 @@ def settings_page():
                     return deviceVal !== '' && Number(deviceVal) === index;
                 });
                 if (existing) return;
-                addRow({ id: `cam${index}`, name: `Camera ${index}`, device: index, port: '', width: '', height: '', fps: '' });
+                const dev = devices.find(d => d.index === index) || {};
+                addRow({ id: `cam${index}`, name: `Camera ${index}`, device: index, port: '', width: dev.resolution?.width || '', height: dev.resolution?.height || '', fps: dev.fps || '', brightness: dev.controls?.brightness ?? '', exposure: dev.controls?.exposure ?? '', white_balance: dev.controls?.white_balance ?? '' });
                 setStatus(`Added device ${index} to the table.`);
             }
 
@@ -849,7 +1008,7 @@ def settings_page():
 
                 const cameras = rows.map(r => {
                     const inputs = Array.from(r.querySelectorAll('input'));
-                    const [id,name,port,width,height,fps] = inputs.map(i => i.value.trim());
+                    const [id,name,port,width,height,fps,brightness,exposure,whiteBalance] = inputs.map(i => i.value.trim());
                     const deviceSelect = r.querySelector('select');
                     const device = deviceSelect ? deviceSelect.value.trim() : '';
                     const deviceNum = device === '' ? NaN : Number(device);
@@ -857,6 +1016,9 @@ def settings_page():
                     const widthNum = width === '' ? null : Number(width);
                     const heightNum = height === '' ? null : Number(height);
                     const fpsNum = fps === '' ? null : Number(fps);
+                    const brightnessNum = brightness === '' ? null : Number(brightness);
+                    const exposureNum = exposure === '' ? null : Number(exposure);
+                    const whiteBalanceNum = whiteBalance === '' ? null : Number(whiteBalance);
 
                     if (!id) errors.push('Camera ID is required.');
                     if (id && seenIds.has(id)) errors.push(`Duplicate camera id "${id}".`);
@@ -871,8 +1033,11 @@ def settings_page():
                     if (widthNum !== null && (!Number.isFinite(widthNum) || widthNum <= 0)) errors.push(`Camera "${id || '(new)'}" width must be positive.`);
                     if (heightNum !== null && (!Number.isFinite(heightNum) || heightNum <= 0)) errors.push(`Camera "${id || '(new)'}" height must be positive.`);
                     if (fpsNum !== null && (!Number.isFinite(fpsNum) || fpsNum <= 0)) errors.push(`Camera "${id || '(new)'}" FPS must be positive.`);
+                    if (brightnessNum !== null && !Number.isFinite(brightnessNum)) errors.push(`Camera "${id || '(new)'}" brightness must be numeric.`);
+                    if (exposureNum !== null && !Number.isFinite(exposureNum)) errors.push(`Camera "${id || '(new)'}" exposure must be numeric.`);
+                    if (whiteBalanceNum !== null && !Number.isFinite(whiteBalanceNum)) errors.push(`Camera "${id || '(new)'}" white balance must be numeric.`);
 
-                    return { id, name, device: deviceNum, port: portNum, width: widthNum, height: heightNum, fps: fpsNum };
+                    return { id, name, device: deviceNum, port: portNum, width: widthNum, height: heightNum, fps: fpsNum, brightness: brightnessNum, exposure: exposureNum, white_balance: whiteBalanceNum };
                 }).filter(c => c.id);
 
                 if (errors.length) {
@@ -925,13 +1090,14 @@ def api_docs_page():
                 <li><code>POST /api/cameras</code> — update host and cameras; regenerates nginx.cameras.conf and restarts capture.</li>
                 <li><code>GET /api/devices</code> — list detected video devices and whether they are already assigned.</li>
             </ul>
-            <p class='muted'>Camera fields: <code>id</code>, <code>name</code>, <code>device</code>, optional <code>port</code>, <code>width</code>, <code>height</code>, and <code>fps</code>.</p>
+            <p class='muted'>Camera fields: <code>id</code>, <code>name</code>, <code>device</code>, optional <code>port</code>, <code>width</code>, <code>height</code>, <code>fps</code>, and optional controls <code>brightness</code>, <code>exposure</code>, <code>white_balance</code>.</p>
             <h3>Streaming</h3>
             <p class='muted'>Replace <code>{{cam_id}}</code> with a configured camera ID.</p>
             <ul>
                 <li><code>/cam/{{cam_id}}/video</code> — MJPEG stream (multipart/x-mixed-replace).</li>
                 <li><code>/cam/{{cam_id}}/snapshot</code> — single JPEG frame.</li>
             </ul>
+            <p class='muted'>Device discovery: <code>/api/devices?max=4&probe_missing=true</code> to scan a specific range when no <code>/dev/video*</code> entries are present.</p>
             <h3>Per-camera ports (Nginx proxy)</h3>
             <p class='muted'>Enable by including <code>nginx.cameras.conf</code> in your nginx configuration.</p>
             <table>
@@ -944,8 +1110,12 @@ def api_docs_page():
 
 
 @app.get("/api/devices")
-def list_devices():
-    return {"devices": discover_cameras()}
+def list_devices(max: Optional[int] = None, probe_missing: Optional[bool] = None):  # noqa: A002
+    return {
+        "devices": discover_cameras(
+            max_devices=max, probe_when_empty=probe_missing
+        )
+    }
 
 
 @app.get("/api/cameras")

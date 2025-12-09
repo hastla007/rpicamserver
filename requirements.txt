@@ -1,6 +1,9 @@
 fastapi
 uvicorn
 opencv-python
+numpy
 pydantic
 pytest
+httpx
+pytest-asyncio
 ruff

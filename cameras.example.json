@@ -8,7 +8,10 @@
       "port": 8081,
       "width": 1280,
       "height": 720,
-      "fps": 30
+      "fps": 30,
+      "brightness": 0.5,
+      "exposure": -4,
+      "white_balance": 4500
     },
     {
       "id": "cam2",
