@@ -1299,9 +1299,9 @@ def settings_page():
                     <td><input class='input' value='${cam.width ?? ''}' type='number' min='0' style='width:100px' placeholder='auto'></td>
                     <td><input class='input' value='${cam.height ?? ''}' type='number' min='0' style='width:100px' placeholder='auto'></td>
                     <td><input class='input' value='${cam.fps ?? ''}' type='number' min='0' step='0.1' style='width:100px' placeholder='auto'></td>
-                    <td><input class='input' value='${cam.brightness ?? ''}' type='number' step='0.1' min='0' max='1' style='width:120px' placeholder='0.0–1.0'></td>
-                    <td><input class='input' value='${cam.exposure ?? ''}' type='number' step='0.1' min='0' max='10000' style='width:120px' placeholder='0–10000'></td>
-                    <td><input class='input' value='${cam.white_balance ?? ''}' type='number' step='1' min='0' max='12000' style='width:120px' placeholder='0–12000'></td>
+                    <td><input class='input' value='${cam.brightness ?? ''}' type='number' step='0.1' min='0' max='1' style='width:120px' placeholder='0.0–1.0' title='Brightness range 0.0–1.0; blank uses camera default'></td>
+                    <td><input class='input' value='${cam.exposure ?? ''}' type='number' step='0.1' min='0' max='10000' style='width:120px' placeholder='0–10000' title='Exposure range 0–10,000 (device units); blank uses camera default'></td>
+                    <td><input class='input' value='${cam.white_balance ?? ''}' type='number' step='1' min='0' max='12000' style='width:120px' placeholder='0–12000' title='White balance range 0–12,000 (Kelvin if supported); blank uses camera default'></td>
                     <td style='width:60px; text-align:right;'><button class='btn-secondary btn' onclick='this.closest("tr").remove(); updateDeviceSelects();'>✖</button></td>
                 `;
                 tbody.appendChild(tr);
@@ -1328,7 +1328,7 @@ def settings_page():
             }
 
             async function refreshDevices(showStatus=true, allowSkip=false) {
-                if (allowSkip && !probeMissingEl.checked && !defaultProbeMissing && !devices.length) {
+                if (allowSkip && !probeMissingEl.checked && !devices.length) {
                     renderDeviceList();
                     updateDeviceSelects();
                     if (showStatus) setStatus('Discovery skipped. Enable probing to scan indices.', 'muted');
