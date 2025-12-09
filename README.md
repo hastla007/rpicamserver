@@ -129,5 +129,9 @@ case it addresses.
 - OpenCV requires access to camera devices; ensure the user running the server
   has permissions for `/dev/video*`.
 - If a camera fails to start, the server logs the error and continues with the
-  remaining devices.
+  remaining devices. Capture threads monitor failures and attempt automatic
+  restarts when reads fail repeatedly.
+- Streaming endpoints are async-based so multiple clients can connect without
+  blocking, and capture threads pause when no subscribers are connected to save
+  CPU.
 - You can also run `python app.py` to start uvicorn with default settings.
