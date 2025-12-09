@@ -119,6 +119,41 @@ You can discover attached cameras (and which ones are already assigned) with
 - `GET /cam/{id}/video` – MJPEG video stream for camera `{id}`
 - `GET /cam/{id}/snapshot` – Single JPEG frame for camera `{id}`
 
+## Testing and CI
+
+- Run unit tests locally with `pytest`.
+- Lint the codebase with `ruff check .` (configured to ignore long HTML lines).
+- GitHub Actions runs both linting and tests on pushes and pull requests via `.github/workflows/ci.yml`.
+
+## Packaging and deployment
+
+### Docker
+
+Build and run the containerized server:
+
+```bash
+docker build -t rpicamserver .
+docker run --rm -p 8000:8000 -p 8081-8090:8081-8090 \
+  -v $(pwd)/cameras.json:/app/cameras.json \
+  rpicamserver
+```
+
+Update the published ports to cover the range you plan to use. The container
+runs `uvicorn app:app` on port 8000 and generates `nginx.cameras.conf` inside
+the container.
+
+### systemd service
+
+An example service file is provided at `systemd/rpicamserver.service`. Copy the
+project to `/opt/rpicamserver`, adjust the `User`, `Group`, and `APP_PORT`
+environment variables as needed, then enable and start:
+
+```bash
+sudo cp systemd/rpicamserver.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now rpicamserver
+```
+
 ## Licensing & contributions
 
 This project is distributed under the [MIT License](LICENSE). Contributions are
@@ -134,4 +169,5 @@ case it addresses.
 - Streaming endpoints are async-based so multiple clients can connect without
   blocking, and capture threads pause when no subscribers are connected to save
   CPU.
+- Logging is emitted to stdout/stderr and `/dev/log` (syslog) when available.
 - You can also run `python app.py` to start uvicorn with default settings.

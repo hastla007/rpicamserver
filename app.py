@@ -12,9 +12,11 @@ central FastAPI endpoints.
 import asyncio
 import glob
 import json
+import logging
 import os
 import threading
 import time
+from logging.handlers import SysLogHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +31,35 @@ NGINX_CONFIG_PATH = Path("nginx.cameras.conf")
 DEFAULT_CAMERA_HOST = "0.0.0.0"
 DEFAULT_START_PORT = 8081
 APP_PORT = int(os.getenv("APP_PORT", "8000"))
+
+logger = logging.getLogger("rpicamserver")
+
+
+def setup_logging() -> None:
+    if logger.handlers:
+        return
+
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    try:
+        syslog_handler = SysLogHandler(address="/dev/log")
+    except OSError:
+        syslog_handler = None
+
+    if syslog_handler:
+        syslog_handler.setFormatter(formatter)
+        logger.addHandler(syslog_handler)
+
+
+setup_logging()
 
 app = FastAPI(title="Raspberry Pi Camera Server")
 
@@ -103,9 +134,9 @@ class Camera:
             self.cap = self._open_capture()
             self.failure_count = 0
             self.idle_event.set()
-            print(f"Restarted camera device {self.device_index}")
+            logger.info("Restarted camera device %s", self.device_index)
         except Exception as exc:  # noqa: BLE001
-            print(f"Failed to restart camera {self.device_index}: {exc}")
+            logger.error("Failed to restart camera %s: %s", self.device_index, exc)
 
     def _update_loop(self) -> None:
         while self.running:
@@ -222,7 +253,7 @@ def load_config() -> Dict[str, Any]:
     try:
         validate_camera_entries(assigned_cameras)
     except ValueError as exc:  # noqa: BLE001
-        print(f"Invalid camera configuration: {exc}. Resetting to defaults.")
+        logger.warning("Invalid camera configuration: %s. Resetting to defaults.", exc)
         config = default_config()
         assigned_cameras = []
 
@@ -387,11 +418,11 @@ def init_cameras() -> None:
         try:
             camera = Camera(device_index, width=width, height=height, fps=fps)
         except Exception as exc:  # noqa: BLE001
-            print(f"Failed to start camera {cam_id}: {exc}")
+            logger.error("Failed to start camera %s: %s", cam_id, exc)
             continue
 
         CAMERAS[cam_id] = camera
-        print(f"Started camera {cam_id} on device {device_index}")
+        logger.info("Started camera %s on device %s", cam_id, device_index)
 
 
 ###############################################################################
@@ -452,10 +483,12 @@ def startup_event() -> None:
     CAMERA_CONFIG = load_config()
     init_cameras()
     generate_nginx_config(CAMERA_CONFIG)
+    logger.info("Camera server started with %d configured camera(s)", len(CAMERA_CONFIG.get("cameras", [])))
 
 
 @app.on_event("shutdown")
 def shutdown_event() -> None:
+    logger.info("Shutting down camera server")
     stop_cameras()
 
 
@@ -923,7 +956,7 @@ def get_cameras():
 @app.post("/api/cameras")
 def set_cameras(data: CamerasUpdate):
     global CAMERA_CONFIG
-    camera_dicts = [cam.dict() for cam in data.cameras]
+    camera_dicts = [cam.model_dump() for cam in data.cameras]
     try:
         validate_camera_entries(camera_dicts)
     except ValueError as exc:  # noqa: BLE001
