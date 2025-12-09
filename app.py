@@ -356,7 +356,7 @@ def default_config() -> Dict[str, Any]:
         "host": DEFAULT_CAMERA_HOST,
         "auth": {
             "enabled": False,
-            "protect_streams": False,
+            "protect_streams": True,
             "username": "",
             "password": "",
         },
@@ -459,7 +459,12 @@ def load_config() -> Dict[str, Any]:
     if "auth" not in config:
         config["auth"] = default_config()["auth"].copy()
     else:
-        config["auth"].setdefault("protect_streams", False)
+        auth_cfg = config.get("auth", {})
+        if auth_cfg.get("enabled") and "protect_streams" not in auth_cfg:
+            auth_cfg["protect_streams"] = True
+        else:
+            auth_cfg.setdefault("protect_streams", False)
+        config["auth"] = auth_cfg
 
     assigned_cameras = assign_ports(config.get("cameras", []))
     try:
@@ -651,7 +656,7 @@ class CameraConfig(BaseModel):
 class AuthConfig(BaseModel):
     enabled: bool = Field(default=False, description="Enable HTTP basic auth")
     protect_streams: bool = Field(
-        default=False, description="Apply auth to /cam/* streams as well"
+        default=True, description="Apply auth to /cam/* streams as well"
     )
     username: str = Field(default="", description="Basic auth username")
     password: str = Field(default="", description="Basic auth password")
